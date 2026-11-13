@@ -1,0 +1,8 @@
+# Keep CRLF on Windows scripts without stripping UTF-8 BOM on .ps1 files
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.vbs text eol=crlf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.svg text eol=lf

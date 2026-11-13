@@ -1,0 +1,18 @@
+{
+  "name": "antigravity-zh-plus",
+  "displayName": "Antigravity 汉化 Plus（界面 + 思考双语版）",
+  "version": "1.0.0",
+  "description": "Google Antigravity 零改包全自动中文动态汉化与 AI 思考框中英对照实时翻译插件（防官方更新失效、保护代码胶囊、零反代风险）。",
+  "author": {
+    "name": "daidai1215",
+    "url": "https://github.com/daidai1215"
+  },
+  "homepage": "https://github.com/daidai1215/antigravity-zh-plus",
+  "repository": "https://github.com/daidai1215/antigravity-zh-plus",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "一键安装并开启 Antigravity 全自动中文汉化与思考框双语翻译",
+    "检查当前 Antigravity 汉化守护与思考框翻译运行状态",
+    "更新汉化器词库或切换思考框翻译源（免 Key 网页翻译 / 官方 Gemini API）"
+  ]
+}

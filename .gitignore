@@ -1,0 +1,14 @@
+# Binaries and runtime artifacts (downloaded dynamically during install)
+*.exe
+*.dll
+*.bak
+*.bak.*
+*.tmp.*
+SHA256SUMS
+VERSION.txt
+antigravity-hans-overlay.js
+antigravity-hans-overlay.meta.json
+thought-config.json
+launcher.log*
+.DS_Store
+Thumbs.db

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" fill="none">
+  <defs>
+    <linearGradient id="bgGrad" x1="28" y1="28" x2="228" y2="228" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#2563EB"/>
+      <stop offset="100%" stop-color="#4F46E5"/>
+    </linearGradient>
+  </defs>
+  <!-- ~11% outer transparent margin baked in (28px on 256x256) -->
+  <rect x="28" y="28" width="200" height="200" rx="44" fill="url(#bgGrad)" stroke="#93C5FD" stroke-width="4"/>
+  <!-- Stylized bilingual card motif -->
+  <rect x="54" y="56" width="96" height="92" rx="20" fill="#FFFFFF" fill-opacity="0.16" stroke="#E0E7FF" stroke-width="2.5"/>
+  <text x="102" y="118" text-anchor="middle" font-family="Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif" font-size="56" font-weight="700" fill="#FFFFFF">汉</text>
+  <!-- Floating thought/code badge -->
+  <rect x="114" y="116" width="88" height="84" rx="20" fill="#0F172A" stroke="#7DD3FC" stroke-width="3"/>
+  <text x="158" y="169" text-anchor="middle" font-family="Consolas, ui-monospace, SFMono-Regular, monospace" font-size="34" font-weight="700" fill="#38BDF8">&lt;/&gt;</text>
+  <!-- Sparkle dot -->
+  <circle cx="194" cy="72" r="8" fill="#FDE047"/>
+</svg>

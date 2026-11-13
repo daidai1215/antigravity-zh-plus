@@ -1,0 +1,6 @@
+{
+  "enabled": true,
+  "provider": "auto",
+  "geminiApiKey": "",
+  "geminiModel": "gemini-3.5-flash-lite"
+}
