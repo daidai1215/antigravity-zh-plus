@@ -12,9 +12,9 @@
 2. **精准防孤儿进程误判**：智能区分真正的 Antigravity 主窗口与后台残留插件/语言服务进程（`--type=`、`--import`），点击桌面 `Antigravity 中文` 图标永不“空转”。
 3. **对话动作标签即时汉化**：自动将对话流中的 `Thought for 24s`（`已思考 24 秒`）、`Thinking...`（`思考中...`）、`Worked for 2m`（`已工作 2 分`）、`Edited`（`已编辑`）、`Analyzed`（`已分析`）、`Created`、`Ran`、`Read` 等标签汉化，且绝不误伤右侧代码文件名胶囊。
 4. **思考框中英对照实时翻译 + 代码反引号保护**：展开思考框（或流式思考中）自动在英文段落下方附上简体中文译文；自动保护 `` `Write-LiveStatus` ``、`` `$onLine` `` 等 `<code>` 胶囊、CLI 参数、文件路径与混合大小写变量名不被翻坏。
-5. **100% 零反代风险**：
-   - **默认免 Key 即装即用**：匿名直连公开 `translate.googleapis.com`（`POST`，`credentials: 'omit'`），绝不读取或借用 Antigravity 内部 OAuth / LanguageServer 会话。
-   - **可选官方 `gemini-3.5-flash-lite`**：支持填入你在 Google AI Studio 独立申请的 `GEMINI_API_KEY`，直连官方 Interactions API（`v1beta/interactions`，`thinking_level: "minimal"`，`store: false`），异常时自动无感降级网页翻译。
+5. **100% 零反代风险 + 多源自动防限流容灾**：
+   - **默认免 Key 多引擎自动切换**：优先匿名直连 `translate.googleapis.com`；一旦遇到共享代理节点触发 Google `429` 限流或网络不通，**毫秒级熔断并自动无感切换至 `MyMemory` / `腾讯交互翻译 TranSmart` 备用源**（全程 `credentials: 'omit'`，绝不读取或借用 Antigravity 内部 OAuth / LanguageServer 会话）。
+   - **可选官方 `gemini-3.5-flash-lite`**：支持填入你在 Google AI Studio 独立申请的 `GEMINI_API_KEY`，直连官方 Interactions API（`v1beta/interactions`，`thinking_level: "minimal"`，`store: false`），异常时同样自动降级至免 Key 备用源。
 
 ---
 
@@ -95,7 +95,7 @@ antigravity-zh-plus/
 
 ## 隐私与安全说明
 
-- **翻译请求**：启用思考框翻译时，展开/流式思考框中的英文段落（代码反引号与标识符已在本地打码替换为占位符）会通过 HTTPS 发送至 `translate.googleapis.com` 或 `generativelanguage.googleapis.com`；无需外发时可随时切换关闭思考框翻译。
+- **翻译请求**：启用思考框翻译时，展开/流式思考框中的英文段落（代码反引号与标识符已在本地打码替换为占位符）会通过 HTTPS 发送至 `translate.googleapis.com`（限流时自动切换 `api.mymemory.translated.net` 或 `transmart.qq.com`）或 `generativelanguage.googleapis.com`；无需外发时可随时切换关闭思考框翻译。
 - **零二进制托管**：本仓库仅包含透明可读的源码脚本，运行时二进制由安装脚本直接从上游官方 Release 拉取并强制核对 `SHA256SUMS`。
 
 ## 致谢与开源协议

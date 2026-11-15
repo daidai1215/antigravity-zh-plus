@@ -28,7 +28,7 @@
   const normalizedProvider = String(CONFIG.provider || 'auto').trim().toLowerCase();
   const ADDON_FINGERPRINT =
     String(window.__antigravityZhPatchRequestedFingerprint || 'ext') +
-    '|thought-v3|' +
+    '|thought-v5|' +
     String(CONFIG._buildId || '') +
     '|' +
     String(Boolean(CONFIG.enabled)) +
@@ -509,7 +509,128 @@
     }
   }
 
-  async function translateViaGoogleFree(maskedText) {
+  const FREE_PROVIDER_COOLDOWN_MS = 180000;
+  const ALL_COOLDOWN_PROBE_INTERVAL_MS = 15000;
+  const providerCooldownUntil = { gtx: 0, mymemory: 0, transmart: 0 };
+  let lastAllCooldownProbeAt = 0;
+  const utf8Encoder = typeof TextEncoder === 'function' ? new TextEncoder() : null;
+
+  function getUtf8ByteLength(str) {
+    return utf8Encoder ? utf8Encoder.encode(str).length : str.length * 3;
+  }
+
+  const NAMED_ENTITIES = {
+    quot: '"',
+    apos: "'",
+    lt: '<',
+    gt: '>',
+    amp: '&'
+  };
+
+  function decodeSafeHtmlEntities(str) {
+    if (!str || str.indexOf('&') === -1) return str;
+    return str.replace(/&(?:#(\d{1,7})|#x([0-9a-fA-F]{1,6})|(quot|apos|lt|gt|amp));/gi, (full, dec, hex, named) => {
+      if (dec !== undefined) {
+        const cp = parseInt(dec, 10);
+        return (cp === 0x27 || (cp >= 0x20 && cp <= 0x10FFFF && (cp < 0xD800 || cp > 0xDFFF))) ? String.fromCodePoint(cp) : full;
+      }
+      if (hex !== undefined) {
+        const cp = parseInt(hex, 16);
+        return (cp >= 0x20 && cp <= 0x10FFFF && (cp < 0xD800 || cp > 0xDFFF)) ? String.fromCodePoint(cp) : full;
+      }
+      if (named !== undefined) {
+        const key = named.toLowerCase();
+        return Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, key) ? NAMED_ENTITIES[key] : full;
+      }
+      return full;
+    });
+  }
+
+  function splitOversizedAtomSafe(tokenStr, maxBytes, prefix) {
+    const atomRe = new RegExp('(__' + prefix + '\\d+__)', 'g');
+    const pieces = tokenStr.split(atomRe).filter(Boolean);
+    const subChunks = [];
+    let buf = '';
+    let bufBytes = 0;
+
+    const flushBuf = () => {
+      const t = buf.trim();
+      if (t) subChunks.push(t);
+      buf = '';
+      bufBytes = 0;
+    };
+
+    for (const piece of pieces) {
+      if (atomRe.test(piece)) {
+        atomRe.lastIndex = 0;
+        const pBytes = getUtf8ByteLength(piece);
+        if (bufBytes + pBytes > maxBytes && buf) flushBuf();
+        buf += piece;
+        bufBytes += pBytes;
+        if (bufBytes >= maxBytes) flushBuf();
+      } else {
+        atomRe.lastIndex = 0;
+        for (const ch of Array.from(piece)) {
+          const cBytes = getUtf8ByteLength(ch);
+          if (bufBytes + cBytes > maxBytes && buf) flushBuf();
+          buf += ch;
+          bufBytes += cBytes;
+        }
+      }
+    }
+    flushBuf();
+    return subChunks;
+  }
+
+  function splitMaskedTextByBytes(text, maxBytes, prefix) {
+    if (getUtf8ByteLength(text) <= maxBytes) return [text];
+    const sentences = text.match(/[^.!?;]+[.!?;]*\s*/g) || [text];
+    const chunks = [];
+    let current = '';
+
+    const flushCurrent = () => {
+      const trimmed = current.trim();
+      if (trimmed) chunks.push(trimmed);
+      current = '';
+    };
+
+    for (const seg of sentences) {
+      if (getUtf8ByteLength(current + seg) <= maxBytes) {
+        current += seg;
+        continue;
+      }
+      flushCurrent();
+      if (getUtf8ByteLength(seg) <= maxBytes) {
+        current = seg;
+        continue;
+      }
+      const parts = seg.split(/(\s+)/);
+      for (const part of parts) {
+        if (!part) continue;
+        if (getUtf8ByteLength(current + part) <= maxBytes) {
+          current += part;
+        } else {
+          flushCurrent();
+          if (getUtf8ByteLength(part) <= maxBytes) {
+            current = part;
+          } else {
+            const safeSubs = splitOversizedAtomSafe(part, maxBytes, prefix);
+            for (let i = 0; i < safeSubs.length; i++) {
+              if (i < safeSubs.length - 1) {
+                chunks.push(safeSubs[i]);
+              } else {
+                current = safeSubs[i];
+              }
+            }
+          }
+        }
+      }
+    }
+    flushCurrent();
+    return chunks;
+  }
+
+  async function translateViaGoogleGtx(maskedText) {
     const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=zh-CN&dt=t';
     const data = await fetchJsonWithTimeout(url, {
       method: 'POST',
@@ -517,11 +638,111 @@
       referrerPolicy: 'no-referrer',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
       body: 'q=' + encodeURIComponent(maskedText)
-    }, 14000);
+    }, 6500);
     if (!Array.isArray(data) || !Array.isArray(data[0])) {
       throw new Error('Unexpected Google Translate payload');
     }
-    return data[0].map(seg => (Array.isArray(seg) && typeof seg[0] === 'string' ? seg[0] : '')).join('').trim();
+    const out = data[0].map(seg => (Array.isArray(seg) && typeof seg[0] === 'string' ? seg[0] : '')).join('').trim();
+    if (!out) throw new Error('Empty Google Translate output');
+    return out;
+  }
+
+  async function translateViaMyMemory(maskedText, prefix) {
+    const chunks = splitMaskedTextByBytes(maskedText, 420, prefix);
+    if (chunks.length === 0 || chunks.length > 10) {
+      throw new Error('Unsupported MyMemory chunk count');
+    }
+    const outParts = [];
+    for (const ch of chunks) {
+      if (disposed) throw new Error('Disposed');
+      const data = await fetchJsonWithTimeout('https://api.mymemory.translated.net/get', {
+        method: 'POST',
+        credentials: 'omit',
+        referrerPolicy: 'no-referrer',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+        body: 'langpair=en%7Czh-CN&q=' + encodeURIComponent(ch)
+      }, 10000);
+      if (!data || data.quotaFinished === true || (data.responseStatus && Number(data.responseStatus) !== 200)) {
+        throw new Error('MyMemory status/quota failure');
+      }
+      const rawTr = data.responseData && typeof data.responseData.translatedText === 'string'
+        ? data.responseData.translatedText.trim()
+        : '';
+      if (!rawTr || /^(?:MAX ALLOWED QUERY|MYMEMORY WARNING|QUERY LENGTH LIMIT)/i.test(rawTr)) {
+        throw new Error('MyMemory rejected query');
+      }
+      outParts.push(decodeSafeHtmlEntities(rawTr));
+    }
+    const joined = outParts.join(' ').replace(/\s+/g, ' ').trim();
+    if (!joined) throw new Error('Empty MyMemory output');
+    return joined;
+  }
+
+  async function translateViaTranSmart(maskedText) {
+    const clientKey = 'browser-chrome-120.0.0-Windows_10-agy-' + Math.random().toString(36).slice(2, 10);
+    const data = await fetchJsonWithTimeout('https://transmart.qq.com/api/imt', {
+      method: 'POST',
+      credentials: 'omit',
+      referrerPolicy: 'no-referrer',
+      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+      body: JSON.stringify({
+        header: { fn: 'auto_translation', client_key: clientKey },
+        type: 'plain',
+        model_category: 'normal',
+        source: { lang: 'en', text_list: [maskedText] },
+        target: { lang: 'zh' }
+      })
+    }, 6500);
+    if (!data || !data.header || data.header.ret_code !== 'succ' || !Array.isArray(data.auto_translation)) {
+      throw new Error('Unexpected TranSmart payload');
+    }
+    const out = data.auto_translation.map(s => (typeof s === 'string' ? s : '')).join('').trim();
+    if (!out) throw new Error('Empty TranSmart output');
+    return out;
+  }
+
+  async function translateViaFreeCascade(maskedText, prefix, tokenCount) {
+    const chain = [
+      { key: 'gtx', fn: () => translateViaGoogleGtx(maskedText) },
+      { key: 'mymemory', fn: () => translateViaMyMemory(maskedText, prefix) },
+      { key: 'transmart', fn: () => translateViaTranSmart(maskedText) }
+    ];
+
+    const now = Date.now();
+    const allCooling = chain.every(it => now < providerCooldownUntil[it.key]);
+    let singleProbeKey = null;
+    if (allCooling) {
+      if ((now - lastAllCooldownProbeAt) < ALL_COOLDOWN_PROBE_INTERVAL_MS) {
+        throw new Error('All free translation providers are cooling down');
+      }
+      lastAllCooldownProbeAt = now;
+      // Probe only the earliest-expiring provider instead of resetting all cooldowns
+      singleProbeKey = chain.reduce((best, cur) =>
+        providerCooldownUntil[cur.key] < providerCooldownUntil[best.key] ? cur : best
+      ).key;
+    }
+
+    let lastErr = null;
+    for (const item of chain) {
+      if (disposed) return '';
+      if (singleProbeKey !== null) {
+        if (item.key !== singleProbeKey) continue;
+      } else if (Date.now() < providerCooldownUntil[item.key]) {
+        continue;
+      }
+      try {
+        const cand = await item.fn();
+        if (validatePlaceholders(cand, prefix, tokenCount, false)) {
+          providerCooldownUntil[item.key] = 0;
+          return cand;
+        }
+        throw new Error(item.key + ' placeholder validation failed');
+      } catch (err) {
+        lastErr = err;
+        providerCooldownUntil[item.key] = Date.now() + FREE_PROVIDER_COOLDOWN_MS;
+      }
+    }
+    throw lastErr || new Error('All free translation providers failed');
   }
 
   function isVerifiedAgAppSurface() {
@@ -534,10 +755,10 @@
     );
   }
 
-  async function translateViaOfficialGeminiApi(maskedText, prefix) {
+  async function translateViaOfficialGeminiApi(maskedText, prefix, tokenCount) {
     const apiKey = String(CONFIG.geminiApiKey || '').trim();
     if (!apiKey || !isVerifiedAgAppSurface()) {
-      return translateViaGoogleFree(maskedText);
+      return translateViaFreeCascade(maskedText, prefix, tokenCount);
     }
     const model = String(CONFIG.geminiModel || 'gemini-3.5-flash-lite').trim() || 'gemini-3.5-flash-lite';
     const ex0 = `__${prefix}0__`;
@@ -646,7 +867,7 @@
           let translated = '';
           if (useGemini) {
             try {
-              const cand = await translateViaOfficialGeminiApi(masked, prefix);
+              const cand = await translateViaOfficialGeminiApi(masked, prefix, tokenCount);
               if (validatePlaceholders(cand, prefix, tokenCount, true)) {
                 translated = cand;
                 cacheSet(cacheKey, translated);
@@ -654,14 +875,14 @@
                 throw new Error('Gemini placeholder mismatch');
               }
             } catch (_err) {
-              const fb = await translateViaGoogleFree(masked);
+              const fb = await translateViaFreeCascade(masked, prefix, tokenCount);
               if (validatePlaceholders(fb, prefix, tokenCount, false)) {
                 translated = fb;
                 cacheSet('gtx|' + prefix + '|' + masked, translated);
               }
             }
           } else {
-            const fb = await translateViaGoogleFree(masked);
+            const fb = await translateViaFreeCascade(masked, prefix, tokenCount);
             if (validatePlaceholders(fb, prefix, tokenCount, false)) {
               translated = fb;
               cacheSet(cacheKey, translated);
