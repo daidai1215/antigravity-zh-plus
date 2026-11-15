@@ -42,6 +42,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<skill_dir>/scripts/man
 
 Then read `<scratch_dir>/zh-plus-result.json` to verify `installed: true`, `overlayBuilt: true`, `thoughtConfig.configValid: true`, and `statusOutput`.
 
+> **Important for AI Agent Shells (`run_command`)**: Non-daemon agent tool calls execute inside a Windows Job Object that terminates child processes when the command exits. After running `install`, `update`, `rebuild`, or `enable-guard` from an agent shell, if `status` shows `后台自动汉化守护 : 未运行`, launch `launch-hans.ps1 -Watch` in a separate `run_command` call with `IsDaemon: true` so `WatchGuard`, `local-bridge.ps1`, and the CDP monitor persist continuously in the background.
+
 ## Utility Scripts
 
 All operations go through [manage-zh-plus.ps1](./scripts/manage-zh-plus.ps1):
