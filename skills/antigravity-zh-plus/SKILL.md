@@ -18,7 +18,8 @@ Deploys and manages a dynamic Chinese localization + real-time bilingual thinkin
 
 - **No `app.asar` Modification & Auto-Update Re-Attach**: Never modifies Antigravity's installation files. `WatchGuard` monitors real UI processes and re-attaches via local CDP within ~3 seconds whenever Antigravity restarts after an official update.
 - **Zero-Key Local Direct Bridge + Multi-Paragraph Batching (Anti-429)**: Runs a lightweight loopback-only bridge ([local-bridge.ps1](./scripts/runtime/local-bridge.ps1), `127.0.0.1:47831`, protected by Origin check + 128-bit `bridgeToken`) with `UseProxy = false` so zero-key requests bypass shared foreign proxy exit IPs (`HTTP 429`) and connect directly via the user's residential broadband IP to Tencent AI Lab `transmart.qq.com/api/imt`, batching up to 8 paragraphs per thinking block into a single HTTP request (~75% fewer calls).
-- **Optional Account-Level Free/Official LLM APIs**: Supports one-command or interactive configuration of **Zhipu official free `glm-4-flash`** (`zhipu`), **SiliconFlow free `Qwen/Qwen2.5-7B-Instruct` / DeepSeek / custom OpenAI-compatible APIs** (`openai-compat`), or **Google AI Studio `gemini-3.5-flash-lite`** (`gemini`), with automatic fallback to the local direct bridge.
+- **Optional Account-Level Free/Official LLM APIs & Local Offline Models**: Supports one-command or interactive configuration of **Zhipu official free `glm-4-flash`** (`zhipu`), **SiliconFlow free `Qwen/Qwen2.5-7B-Instruct` / DeepSeek / custom OpenAI-compatible APIs** (`openai-compat`), **Google AI Studio `gemini-3.5-flash-lite`** (`gemini`), or **local offline `Ollama` models** (`local-llm`, e.g. `qwen2.5:3b` on `http://127.0.0.1:11434/v1/chat/completions`), with automatic fallback to the local direct bridge.
+- **Inline Rate-Limit & Failure Guidance**: If all translation channels encounter concurrent rate limiting or network failure, renders a non-intrusive inline tip bar inside the thinking block with a one-click `[立即重试]` button and clear instructions to connect a free personal API key, deploy a local Ollama model, or update the skill/plugin.
 - **No Internal Session Reuse**: Never reads or reuses Antigravity's internal OAuth or LanguageServer tokens.
 
 ## Privacy, Credentials & Safety
@@ -72,7 +73,18 @@ Never pass plaintext API keys directly in command-line arguments. Either:
 
    # Google AI Studio Official Gemini:
    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<skill_dir>/scripts/manage-zh-plus.ps1" -Command set-provider -Provider gemini -GeminiApiKeyEnv GEMINI_API_KEY -OutputFile "<scratch_dir>/zh-provider.json"
+
+   # Local Offline Ollama Model (zero API key, zero network):
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<skill_dir>/scripts/manage-zh-plus.ps1" -Command set-provider -Provider local-llm -LlmBaseUrl "http://127.0.0.1:11434/v1/chat/completions" -LlmModel "qwen2.5:3b" -OutputFile "<scratch_dir>/zh-provider.json"
    ```
+
+### Updating the Skill & Plugin from GitHub
+
+When the user asks to "更新 antigravity-zh-plus / 更新汉化 skill", run the published pure-ASCII installer to pull the latest plugin, skill, and runtime in place:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/daidai1215/antigravity-zh-plus/main/install.ps1 | iex"
+```
 
 ## Rate Limiting & Concurrency
 

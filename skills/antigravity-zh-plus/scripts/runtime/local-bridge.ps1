@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
-$BridgeRuntimeVersion = '1.1.0'
+$BridgeRuntimeVersion = '1.2.0'
 $ToolDir = $PSScriptRoot
 $ConfigPath = Join-Path $ToolDir 'thought-config.json'
 $StateDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'antigravity-hans-guard'
@@ -684,7 +684,39 @@ namespace AgyZhPlus
             bool hasLlmKey = !string.IsNullOrWhiteSpace(cfg.LlmApiKey);
             bool hasGemKey = !string.IsNullOrWhiteSpace(cfg.GeminiApiKey);
 
-            if (prov == "zhipu" || (prov == "auto" && hasLlmKey && cfg.LlmBaseUrl.IndexOf("bigmodel.cn", StringComparison.OrdinalIgnoreCase) >= 0))
+            if (prov == "local-llm")
+            {
+                string localUrl = (string.IsNullOrWhiteSpace(cfg.LlmBaseUrl) || cfg.LlmBaseUrl.IndexOf("bigmodel.cn", StringComparison.OrdinalIgnoreCase) >= 0)
+                    ? "http://127.0.0.1:11434/v1/chat/completions"
+                    : cfg.LlmBaseUrl;
+                string localModel = (string.IsNullOrWhiteSpace(cfg.LlmModel) || string.Equals(cfg.LlmModel, "glm-4-flash", StringComparison.OrdinalIgnoreCase))
+                    ? "qwen2.5:3b"
+                    : cfg.LlmModel;
+                Uri localUri;
+                if (IsSafeLlmEndpointUri(localUrl, out localUri))
+                {
+                    try
+                    {
+                        using (CancellationTokenSource localCts = CancellationTokenSource.CreateLinkedTokenSource(shutdownCt))
+                        {
+                            localCts.CancelAfter(20000);
+                            List<string> tr = await TranslateViaOpenAiCompatAsync(
+                                _directClient,
+                                localUri.AbsoluteUri,
+                                cfg.LlmApiKey,
+                                localModel,
+                                texts,
+                                ser,
+                                localCts.Token).ConfigureAwait(false);
+                            return Tuple.Create("local-llm:" + localModel, tr);
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+            else if (prov == "zhipu" || (prov == "auto" && hasLlmKey && cfg.LlmBaseUrl.IndexOf("bigmodel.cn", StringComparison.OrdinalIgnoreCase) >= 0))
             {
                 if (hasLlmKey)
                 {
@@ -850,7 +882,10 @@ namespace AgyZhPlus
 
             using (HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Post, checkedUri))
             {
-                req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + apiKey);
+                if (!string.IsNullOrWhiteSpace(apiKey))
+                {
+                    req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + apiKey);
+                }
                 req.Content = new StringContent(ser.Serialize(body), Encoding.UTF8, "application/json");
                 using (HttpResponseMessage resp = await client.SendAsync(req, ct).ConfigureAwait(false))
                 {

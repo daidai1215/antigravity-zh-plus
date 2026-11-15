@@ -6,7 +6,7 @@ param(
 
     [string]$InstallDir = '',
 
-    [ValidateSet('', 'auto', 'free-direct', 'google-free', 'zhipu', 'openai-compat', 'gemini')]
+    [ValidateSet('', 'auto', 'free-direct', 'google-free', 'zhipu', 'openai-compat', 'local-llm', 'gemini')]
     [string]$Provider = '',
 
     [ValidateSet('', 'true', 'false')]
@@ -523,6 +523,13 @@ function Update-ProviderConfigUnderLock {
                 }
                 if ([string]::IsNullOrWhiteSpace($LlmModel)) {
                     $cfg['llmModel'] = 'glm-4-flash'
+                }
+            } elseif ($cfg['provider'] -eq 'local-llm') {
+                if ([string]::IsNullOrWhiteSpace($LlmBaseUrl)) {
+                    $cfg['llmBaseUrl'] = 'http://127.0.0.1:11434/v1/chat/completions'
+                }
+                if ([string]::IsNullOrWhiteSpace($LlmModel)) {
+                    $cfg['llmModel'] = 'qwen2.5:3b'
                 }
             }
         }

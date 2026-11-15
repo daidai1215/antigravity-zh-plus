@@ -12,11 +12,12 @@
 2. **本地免代理直连桥 + 多段打包（彻底根治共享代理 IP `429` 限流）**：
    - 默认自带仅监听本机回环 `127.0.0.1` 的轻量直连桥（`local-bridge.ps1`，严格校验 `Origin` 与 128 位随机鉴权 Token），强制 `UseProxy = false` **绕开海外共享代理出口 IP**，直接通过你自己的**国内家庭宽带独享 IP** 连接腾讯 AI Lab `transmart.qq.com` 神经机器翻译。
    - 同一思考框内的多段英文自动合并为 **1 次批量请求**（请求次数立减 ~75%），免注册、免填任何 Key 即装即稳。
-3. **支持一键切换免费/官方独立大模型 API Key（上限更高）**：
+3. **支持一键切换免费大模型 API 或本机离线模型（上限更高 + 智能限流引导）**：
    - **智谱清言 `GLM-4-Flash`**：官方长期**完全免费**开放 API，国内直连高并发、最懂技术代码语境；
    - **硅基流动 SiliconFlow / DeepSeek / 百炼**：默认预设硅基流动免费模型 `Qwen/Qwen2.5-7B-Instruct`（¥0），支持任意 OpenAI 兼容接口；
    - **Google AI Studio `GEMINI_API_KEY`**：官方 `gemini-3.5-flash-lite` 直连；
-   - 所有大模型模式异常时均自动无感回退至本地免代理直连桥，且全程 **100% 零反代风险**（绝不读取或借用 Antigravity 内部 OAuth / LanguageServer 会话）。
+   - **本机离线模型 `Ollama`（`local-llm`）**：支持一键连接本机 `http://127.0.0.1:11434/v1/chat/completions`（如 `qwen2.5:3b`），纯离线零联网永不限流；
+   - **智能限流/失败内嵌提示条**：万一遇到极端并发限流或断网导致翻译失败，思考框底部会自动弹出温和提示条（附一键 **「立即重试」** 按钮，并提示接入免费 API、部署本地模型或更新 Skill），绝不静默黑盒。
 4. **思考框中英对照 + 代码反引号原子保护**：展开思考框（或流式思考中）自动在英文段落下方附上简体中文译文；自动保护 `` `Write-LiveStatus` ``、`` `$onLine` `` 等 `<code>` 胶囊、CLI 参数、文件路径与混合大小写变量名不被翻坏。
 5. **精准防孤儿进程误判**：智能区分真正的 Antigravity 主窗口与后台残留插件/语言服务进程（`--type=`、`--import`），点击桌面 `Antigravity 中文` 图标永不“空转”。
 
@@ -64,7 +65,8 @@ agy plugin install .\antigravity-zh-plus
     - `[2]` 配置智谱清言官方免费大模型 `GLM-4-Flash` API Key
     - `[3]` 配置硅基流动 SiliconFlow（免费 `Qwen2.5-7B`）/ DeepSeek / 自定义 OpenAI 兼容接口
     - `[4]` 配置 Google AI Studio 独立 `GEMINI_API_KEY`（`gemini-3.5-flash-lite`）
-    - `[5]` 关闭思考框实时翻译（仅保留基础界面汉化）
+    - `[5]` 连接本机离线翻译模型（`Ollama`，默认 `http://127.0.0.1:11434/v1/chat/completions` + `qwen2.5:3b`）
+    - `[6]` 关闭思考框实时翻译（仅保留基础界面汉化）
 - **`一键更新汉化器.cmd`**：自动检测并升级上游 `Antigravity-Hans` 最新版本（含 SHA-256 强校验），升级后自动重新合成思考框双语覆盖层，无需重配。
 
 ---

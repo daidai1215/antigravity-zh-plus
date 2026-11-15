@@ -32,7 +32,7 @@
   const normalizedProvider = String(CONFIG.provider || 'auto').trim().toLowerCase();
   const ADDON_FINGERPRINT =
     String(window.__antigravityZhPatchRequestedFingerprint || 'ext') +
-    '|thought-v7|' +
+    '|thought-v8|' +
     String(CONFIG._buildId || '') +
     '|' +
     String(Boolean(CONFIG.enabled)) +
@@ -181,13 +181,46 @@
         '  opacity: 0.94;',
         '  word-break: break-word;',
         '}',
+        '.agy-zh-thought-notice {',
+        '  display: flex;',
+        '  flex-wrap: wrap;',
+        '  align-items: center;',
+        '  gap: 6px 10px;',
+        '  margin-top: 8px;',
+        '  padding: 6px 10px;',
+        '  border-radius: 6px;',
+        '  border: 1px solid rgba(245, 158, 11, 0.35);',
+        '  background: rgba(245, 158, 11, 0.08);',
+        '  color: var(--color-foreground, rgba(245, 240, 230, 0.92));',
+        '  font-size: 0.85em;',
+        '  line-height: 1.5;',
+        '}',
+        '.agy-zh-thought-retry-btn {',
+        '  padding: 1px 8px;',
+        '  border-radius: 4px;',
+        '  border: 1px solid rgba(125, 162, 255, 0.5);',
+        '  background: rgba(125, 162, 255, 0.14);',
+        '  color: inherit;',
+        '  font-size: 0.92em;',
+        '  cursor: pointer;',
+        '  white-space: nowrap;',
+        '}',
+        '.agy-zh-thought-retry-btn:hover {',
+        '  background: rgba(125, 162, 255, 0.26);',
+        '}',
         '@media (prefers-color-scheme: light) {',
         '  .agy-zh-thought-line {',
         '    border-left-color: rgba(31, 111, 235, 0.45);',
         '    color: rgba(28, 33, 40, 0.92);',
         '  }',
+        '  .agy-zh-thought-notice {',
+        '    border-color: rgba(217, 119, 6, 0.4);',
+        '    background: rgba(254, 243, 199, 0.55);',
+        '    color: rgba(31, 41, 55, 0.95);',
+        '  }',
         '}',
-        'html[data-agy-thought-lang="en"] .agy-zh-thought-line {',
+        'html[data-agy-thought-lang="en"] .agy-zh-thought-line,',
+        'html[data-agy-thought-lang="en"] .agy-zh-thought-notice {',
         '  display: none !important;',
         '}'
       ].join('\n');
@@ -370,6 +403,9 @@
           parent.removeAttribute('data-agy-zh-rendered');
         }
       }
+      for (const nt of Array.from(document.querySelectorAll('[data-agy-zh-notice]'))) {
+        nt.remove();
+      }
     }
   }
 
@@ -503,7 +539,14 @@
       const opts = ctrl ? Object.assign({}, init, { signal: ctrl.signal }) : init;
       const resp = await nativeFetch(url, opts);
       if (!resp.ok) {
-        throw new Error('HTTP ' + resp.status);
+        let detail = '';
+        try {
+          const errTxt = await resp.text();
+          if (errTxt && errTxt.length <= 1024) detail = ': ' + errTxt.slice(0, 180);
+        } catch (_e) {}
+        const httpErr = new Error('HTTP ' + resp.status + detail);
+        httpErr.status = resp.status;
+        throw httpErr;
       }
       const rawText = await resp.text();
       if (rawText.length > 131072) {
@@ -813,6 +856,7 @@
       throw new Error('Local bridge cooling down');
     }
     try {
+      const timeoutMs = normalizedProvider === 'local-llm' ? 28000 : 24000;
       const data = await fetchJsonWithTimeout('http://127.0.0.1:' + port + '/translate', {
         method: 'POST',
         credentials: 'omit',
@@ -822,7 +866,7 @@
           token: token,
           texts: maskedTexts
         })
-      }, 24000);
+      }, timeoutMs);
       if (!data || data.ok !== true || !Array.isArray(data.translations) || data.translations.length !== maskedTexts.length) {
         throw new Error((data && data.error) ? String(data.error) : 'Invalid bridge payload');
       }
@@ -839,6 +883,9 @@
 
   function getActiveProviderTag() {
     const buildVer = String(CONFIG._buildId || 'dev').slice(0, 8);
+    if (normalizedProvider === 'local-llm') {
+      return 'local-llm:' + (String(CONFIG.llmModel || 'qwen2.5:3b').trim() || 'qwen2.5:3b') + ':' + buildVer;
+    }
     if (Boolean(CONFIG.hasLlmKey) && (normalizedProvider === 'auto' || normalizedProvider === 'zhipu' || normalizedProvider === 'openai-compat')) {
       return 'llm:' + normalizedProvider + ':' + (String(CONFIG.llmModel || 'glm-4-flash').trim() || 'glm-4-flash') + ':' + buildVer;
     }
@@ -1008,7 +1055,69 @@
     renderBilingualSpan(item.block, zhText, latest.prefix, latest.tokens, latestSig);
   }
 
-  function enqueueParagraphBatch(batchItems, providerTag) {
+  function isRateLimitError(err) {
+    if (!err) return false;
+    if (err.status === 429) return true;
+    const msg = String(err.message || err || '');
+    return /\b429\b|too many requests|rate.?limit|quota|cooling down|bridge busy/i.test(msg);
+  }
+
+  function removeFailureNotice(mdRoot) {
+    if (!mdRoot) return;
+    const existing = mdRoot.querySelector(':scope > [data-agy-zh-notice]');
+    if (existing) existing.remove();
+  }
+
+  function renderFailureNotice(mdRoot, err) {
+    if (disposed || currentLang !== 'zh' || !mdRoot || !mdRoot.isConnected) return;
+    const rateLimited = isRateLimitError(err);
+    const kind = rateLimited ? 'rate-limit' : 'error';
+
+    let bar = mdRoot.querySelector(':scope > [data-agy-zh-notice]');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.className = 'agy-zh-thought-notice';
+      bar.setAttribute('data-agy-zh-notice', '1');
+      bar.setAttribute('data-agy-hans-ui', 'thought-notice');
+    } else {
+      while (bar.firstChild) bar.removeChild(bar.firstChild);
+    }
+    bar.setAttribute('data-agy-notice-kind', kind);
+
+    const textSpan = document.createElement('span');
+    const prefixTitle = rateLimited
+      ? '⚠️ 思考翻译触发并发限流，部分内容暂未译出 — '
+      : '⚠️ 思考实时翻译暂时失败 — ';
+    textSpan.textContent =
+      prefixTitle +
+      '可选择：① 接入个人免费 API（打开「管理自动汉化守护.cmd」→ [4] 配智谱免费 GLM-4-Flash / 硅基流动 / Gemini） ' +
+      '② 本地部署离线翻译模型（菜单 [4] → [5] 连接本机 Ollama 如 qwen2.5:3b） ' +
+      '③ 更新 Skill / 插件（对 AI 说「更新 antigravity-zh-plus」获取最新源）。';
+    bar.appendChild(textSpan);
+
+    const retryBtn = document.createElement('button');
+    retryBtn.type = 'button';
+    retryBtn.className = 'agy-zh-thought-retry-btn';
+    retryBtn.textContent = '立即重试';
+    retryBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      bridgeCooldownUntil = 0;
+      providerCooldownUntil.gtx = 0;
+      providerCooldownUntil.mymemory = 0;
+      providerCooldownUntil.transmart = 0;
+      lastAllCooldownProbeAt = 0;
+      removeFailureNotice(mdRoot);
+      processThinkingMarkdownRoot(mdRoot);
+    });
+    bar.appendChild(retryBtn);
+
+    if (bar.parentNode !== mdRoot) {
+      mdRoot.appendChild(bar);
+    }
+  }
+
+  function enqueueParagraphBatch(mdRoot, batchItems, providerTag) {
     if (!batchItems || batchItems.length === 0) return;
 
     const hasLiveSubscriber = () => {
@@ -1050,11 +1159,12 @@
           if (liveItems.length === 0) return '';
 
           let fallbackItems = [];
+          let lastErr = null;
           try {
             const bridgeRes = await translateBatchViaLocalBridge(liveItems.map(x => x.payload.masked));
             const bridgeEngine = bridgeRes.engine || 'transmart-direct';
             const bridgeTranslations = bridgeRes.translations;
-            const expectsConfiguredModel = providerTag.startsWith('llm:') || providerTag.startsWith('gemini:');
+            const expectsConfiguredModel = providerTag.startsWith('llm:') || providerTag.startsWith('local-llm:') || providerTag.startsWith('gemini:');
             const usedFreeFallbackOnBridge = expectsConfiguredModel && bridgeEngine === 'transmart-direct';
 
             for (let i = 0; i < liveItems.length; i++) {
@@ -1069,11 +1179,12 @@
                 fallbackItems.push(it);
               }
             }
-          } catch (_bridgeErr) {
+          } catch (bridgeErr) {
+            lastErr = bridgeErr;
             fallbackItems = liveItems;
           }
 
-          // Seamless browser-direct fallback if local bridge is temporarily unavailable or an item missed validation
+          let unresolvedCount = 0;
           for (const it of fallbackItems) {
             if (disposed) break;
             const st = pendingBlockMap.get(it.block);
@@ -1082,8 +1193,21 @@
               const tr = await translateSingleItemDirect(it.payload, providerTag);
               if (tr) {
                 applyResolvedTranslationToItem(it, tr, providerTag);
+              } else {
+                unresolvedCount++;
               }
-            } catch (_e) {}
+            } catch (singleErr) {
+              lastErr = singleErr;
+              unresolvedCount++;
+            }
+          }
+
+          if (!disposed && mdRoot && mdRoot.isConnected) {
+            if (unresolvedCount > 0) {
+              renderFailureNotice(mdRoot, lastErr);
+            } else {
+              removeFailureNotice(mdRoot);
+            }
           }
           return 'ok';
         }
@@ -1109,7 +1233,7 @@
     const uncachedItems = [];
 
     for (const block of blocks) {
-      if (block.closest('pre, code, table, [data-agy-zh-thought]')) continue;
+      if (block.closest('pre, code, table, [data-agy-zh-thought], [data-agy-zh-notice]')) continue;
       if (block.tagName === 'LI' && block.querySelector('p, h1, h2, h3, h4, h5, h6')) continue;
 
       const payload = extractBlockMaskedPayload(block);
@@ -1152,7 +1276,7 @@
     for (const item of uncachedItems) {
       const len = item.payload.masked.length;
       if (curBatch.length >= MAX_BATCH_PARAGRAPHS || (curBatch.length > 0 && (curChars + len) > MAX_BATCH_TOTAL_CHARS)) {
-        enqueueParagraphBatch(curBatch, providerTag);
+        enqueueParagraphBatch(mdRoot, curBatch, providerTag);
         curBatch = [];
         curChars = 0;
       }
@@ -1160,7 +1284,7 @@
       curChars += len;
     }
     if (curBatch.length > 0) {
-      enqueueParagraphBatch(curBatch, providerTag);
+      enqueueParagraphBatch(mdRoot, curBatch, providerTag);
     }
   }
 

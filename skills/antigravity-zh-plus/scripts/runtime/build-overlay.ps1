@@ -138,7 +138,7 @@ try {
     } else {
         'auto'
     }
-    $allowedProviders = @('auto', 'free-direct', 'google-free', 'zhipu', 'openai-compat', 'gemini')
+    $allowedProviders = @('auto', 'free-direct', 'google-free', 'zhipu', 'openai-compat', 'local-llm', 'gemini')
     if ($normProvider -notin $allowedProviders) {
         throw "thought-config.json 字段 'provider' 非法: $normProvider (支持: $($allowedProviders -join ' / '))。"
     }
@@ -208,7 +208,7 @@ try {
     # Never embed llmApiKey into JS overlay (local-bridge reads it directly on disk); only embed geminiApiKey when browser direct fallback may need it
     $effectiveGemKey = if ($normEnabled -and $normProvider -in @('auto', 'gemini')) { $storedGemKey } else { '' }
     $effectiveBridgeToken = if ($normEnabled) { $cfgToken } else { '' }
-    $hasLlmKeyFlag = ($normEnabled -and (-not [string]::IsNullOrWhiteSpace($storedLlmKey)) -and $normProvider -notin @('free-direct', 'google-free', 'gemini'))
+    $hasLlmKeyFlag = ($normEnabled -and (($normProvider -eq 'local-llm') -or ((-not [string]::IsNullOrWhiteSpace($storedLlmKey)) -and $normProvider -notin @('free-direct', 'google-free', 'gemini'))))
 
     # 2. Strictly extract unique official embedded overlay.js from antigravity-hans-windows-amd64.exe
     $exeBytes = [IO.File]::ReadAllBytes($ExePath)
@@ -329,6 +329,8 @@ try {
     if (-not $Quiet) {
         $provDesc = if (-not $normEnabled) {
             '已关闭 (仅基础界面汉化)'
+        } elseif ($normProvider -eq 'local-llm') {
+            "本机离线翻译模型 ($normLlmModel)"
         } elseif ($hasLlmKeyFlag) {
             "独立大模型 API ($normProvider / $normLlmModel)"
         } elseif (-not [string]::IsNullOrWhiteSpace($effectiveGemKey)) {

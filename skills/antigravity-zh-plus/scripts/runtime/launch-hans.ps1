@@ -16,7 +16,7 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
-$GuardRuntimeVersion = '1.1.0'
+$GuardRuntimeVersion = '1.2.0'
 $ToolDir = $PSScriptRoot
 $HansExeName = 'antigravity-hans-windows-amd64.exe'
 $HansExePath = Join-Path $ToolDir $HansExeName
@@ -681,7 +681,7 @@ function Read-ThoughtConfigNormalized {
         }
         if ($null -ne $obj.PSObject.Properties['provider'] -and $null -ne $obj.provider) {
             $pv = ([string]$obj.provider).Trim().ToLowerInvariant()
-            if ($pv -in @('auto', 'free-direct', 'google-free', 'zhipu', 'openai-compat', 'gemini')) {
+            if ($pv -in @('auto', 'free-direct', 'google-free', 'zhipu', 'openai-compat', 'local-llm', 'gemini')) {
                 $defaults['provider'] = $pv
             } elseif ($Strict) {
                 throw "非法 provider: $pv"
@@ -761,7 +761,9 @@ function Get-ThoughtTranslationSummary {
     $hasGemKey = (-not [string]::IsNullOrWhiteSpace($cfg.geminiApiKey))
     $pv = [string]$cfg.provider
 
-    $srcDesc = if ($hasLlmKey -and $pv -in @('zhipu', 'openai-compat', 'auto')) {
+    $srcDesc = if ($pv -eq 'local-llm') {
+        "本机离线翻译模型 ($($cfg.llmModel) @ $($cfg.llmBaseUrl), 异常自动回退本地直连桥)"
+    } elseif ($hasLlmKey -and $pv -in @('zhipu', 'openai-compat', 'auto')) {
         $tail = if ($cfg.llmApiKey.Length -ge 4) { $cfg.llmApiKey.Substring($cfg.llmApiKey.Length - 4) } else { '****' }
         $label = if ($pv -eq 'zhipu' -or $cfg.llmBaseUrl -match 'bigmodel\.cn') { '智谱官方免费大模型' } else { '独立大模型 API' }
         "$label ($($cfg.llmModel), Key 尾号: $tail, 异常自动回退本地直连桥)"
@@ -1442,7 +1444,8 @@ function Invoke-ThoughtTranslationMenu {
     Write-Host "  [2] 配置智谱清言官方免费大模型 GLM-4-Flash API Key (国内直连永久免费、高并发)"
     Write-Host "  [3] 配置硅基流动 SiliconFlow (免费 Qwen2.5-7B) / DeepSeek / 自定义 OpenAI 兼容接口"
     Write-Host "  [4] 配置 Google AI Studio 独立 GEMINI_API_KEY (直连官方 gemini-3.5-flash-lite)"
-    Write-Host "  [5] 关闭思考框实时翻译 (仅保留基础界面汉化)"
+    Write-Host "  [5] 连接本机离线翻译模型 (Ollama，默认 http://127.0.0.1:11434/v1/chat/completions + qwen2.5:3b)"
+    Write-Host "  [6] 关闭思考框实时翻译 (仅保留基础界面汉化)"
     Write-Host "  [B] 返回"
     $sub = (Read-Host "输入序号").Trim().ToUpperInvariant()
 
@@ -1498,6 +1501,18 @@ function Invoke-ThoughtTranslationMenu {
             }
         }
         '5' {
+            $inLocalUrl = (Read-Host "本机模型地址 (直接回车默认 http://127.0.0.1:11434/v1/chat/completions)").Trim()
+            $inLocalModel = (Read-Host "本机模型名称 (直接回车默认 qwen2.5:3b)").Trim()
+            $pendingUrl = if ([string]::IsNullOrWhiteSpace($inLocalUrl)) { 'http://127.0.0.1:11434/v1/chat/completions' } else { $inLocalUrl }
+            $uLocal = $null
+            if (-not [Uri]::TryCreate($pendingUrl, [UriKind]::Absolute, [ref]$uLocal) -or
+                -not (($uLocal.Scheme -in @('http', 'https')) -and ($uLocal.Host -in @('127.0.0.1', 'localhost')))) {
+                throw "本机离线模型地址仅允许 127.0.0.1 或 localhost: $pendingUrl"
+            }
+            $pendingModel = if ([string]::IsNullOrWhiteSpace($inLocalModel)) { 'qwen2.5:3b' } else { $inLocalModel }
+            $intent = 'set-local-llm'
+        }
+        '6' {
             $intent = 'disable'
         }
         default {
@@ -1562,6 +1577,13 @@ function Invoke-ThoughtTranslationMenu {
                 $cfg['geminiApiKey'] = $pendingKey
                 $cfg['geminiModel'] = 'gemini-3.5-flash-lite'
                 Write-Host "[已保存] 已配置官方 GEMINI_API_KEY (模型: gemini-3.5-flash-lite，失败自动降级本地直连桥)。"
+            }
+            'set-local-llm' {
+                $cfg['enabled'] = $true
+                $cfg['provider'] = 'local-llm'
+                $cfg['llmBaseUrl'] = $pendingUrl
+                $cfg['llmModel'] = $pendingModel
+                Write-Host "[已保存] 已启用本机离线翻译模型 ($pendingModel @ $pendingUrl，异常自动降级本地直连桥)。"
             }
             'disable' {
                 $cfg['enabled'] = $false
