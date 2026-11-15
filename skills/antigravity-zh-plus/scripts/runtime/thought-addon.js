@@ -32,7 +32,7 @@
   const normalizedProvider = String(CONFIG.provider || 'auto').trim().toLowerCase();
   const ADDON_FINGERPRINT =
     String(window.__antigravityZhPatchRequestedFingerprint || 'ext') +
-    '|thought-v8|' +
+    '|thought-v9|' +
     String(CONFIG._buildId || '') +
     '|' +
     String(Boolean(CONFIG.enabled)) +
@@ -163,68 +163,72 @@
   let currentLang = getLang();
 
   function ensureStyleMounted() {
+    const desiredCss = [
+      '.agy-zh-thought-line {',
+      '  display: block;',
+      '  margin-top: 4px;',
+      '  margin-bottom: 2px;',
+      '  padding-left: 8px;',
+      '  border-left: 2px solid rgba(125, 162, 255, 0.45);',
+      '  color: var(--color-foreground, rgba(235, 238, 245, 0.92));',
+      '  font-size: 0.94em;',
+      '  line-height: 1.55;',
+      '  opacity: 0.94;',
+      '  word-break: break-word;',
+      '}',
+      '.agy-zh-thought-notice {',
+      '  display: flex;',
+      '  flex-wrap: wrap;',
+      '  align-items: center;',
+      '  gap: 6px 10px;',
+      '  margin-top: 8px;',
+      '  padding: 6px 10px;',
+      '  border-radius: 6px;',
+      '  border: 1px solid rgba(245, 158, 11, 0.35);',
+      '  background: rgba(245, 158, 11, 0.08);',
+      '  color: var(--color-foreground, rgba(245, 240, 230, 0.92));',
+      '  font-size: 0.85em;',
+      '  line-height: 1.5;',
+      '}',
+      '.agy-zh-thought-retry-btn {',
+      '  padding: 1px 8px;',
+      '  border-radius: 4px;',
+      '  border: 1px solid rgba(125, 162, 255, 0.5);',
+      '  background: rgba(125, 162, 255, 0.14);',
+      '  color: inherit;',
+      '  font-size: 0.92em;',
+      '  cursor: pointer;',
+      '  white-space: nowrap;',
+      '}',
+      '.agy-zh-thought-retry-btn:hover {',
+      '  background: rgba(125, 162, 255, 0.26);',
+      '}',
+      '@media (prefers-color-scheme: light) {',
+      '  .agy-zh-thought-line {',
+      '    border-left-color: rgba(31, 111, 235, 0.45);',
+      '    color: rgba(28, 33, 40, 0.92);',
+      '  }',
+      '  .agy-zh-thought-notice {',
+      '    border-color: rgba(217, 119, 6, 0.4);',
+      '    background: rgba(254, 243, 199, 0.55);',
+      '    color: rgba(31, 41, 55, 0.95);',
+      '  }',
+      '}',
+      'html[data-agy-thought-lang="en"] .agy-zh-thought-line,',
+      'html[data-agy-thought-lang="en"] .agy-zh-thought-notice {',
+      '  display: none !important;',
+      '}'
+    ].join('\n');
+
     let styleEl = document.getElementById(STYLE_ID);
     if (!styleEl) {
       styleEl = document.createElement('style');
       styleEl.id = STYLE_ID;
       styleEl.setAttribute('data-agy-hans-ui', 'thought-style');
-      styleEl.textContent = [
-        '.agy-zh-thought-line {',
-        '  display: block;',
-        '  margin-top: 4px;',
-        '  margin-bottom: 2px;',
-        '  padding-left: 8px;',
-        '  border-left: 2px solid rgba(125, 162, 255, 0.45);',
-        '  color: var(--color-foreground, rgba(235, 238, 245, 0.92));',
-        '  font-size: 0.94em;',
-        '  line-height: 1.55;',
-        '  opacity: 0.94;',
-        '  word-break: break-word;',
-        '}',
-        '.agy-zh-thought-notice {',
-        '  display: flex;',
-        '  flex-wrap: wrap;',
-        '  align-items: center;',
-        '  gap: 6px 10px;',
-        '  margin-top: 8px;',
-        '  padding: 6px 10px;',
-        '  border-radius: 6px;',
-        '  border: 1px solid rgba(245, 158, 11, 0.35);',
-        '  background: rgba(245, 158, 11, 0.08);',
-        '  color: var(--color-foreground, rgba(245, 240, 230, 0.92));',
-        '  font-size: 0.85em;',
-        '  line-height: 1.5;',
-        '}',
-        '.agy-zh-thought-retry-btn {',
-        '  padding: 1px 8px;',
-        '  border-radius: 4px;',
-        '  border: 1px solid rgba(125, 162, 255, 0.5);',
-        '  background: rgba(125, 162, 255, 0.14);',
-        '  color: inherit;',
-        '  font-size: 0.92em;',
-        '  cursor: pointer;',
-        '  white-space: nowrap;',
-        '}',
-        '.agy-zh-thought-retry-btn:hover {',
-        '  background: rgba(125, 162, 255, 0.26);',
-        '}',
-        '@media (prefers-color-scheme: light) {',
-        '  .agy-zh-thought-line {',
-        '    border-left-color: rgba(31, 111, 235, 0.45);',
-        '    color: rgba(28, 33, 40, 0.92);',
-        '  }',
-        '  .agy-zh-thought-notice {',
-        '    border-color: rgba(217, 119, 6, 0.4);',
-        '    background: rgba(254, 243, 199, 0.55);',
-        '    color: rgba(31, 41, 55, 0.95);',
-        '  }',
-        '}',
-        'html[data-agy-thought-lang="en"] .agy-zh-thought-line,',
-        'html[data-agy-thought-lang="en"] .agy-zh-thought-notice {',
-        '  display: none !important;',
-        '}'
-      ].join('\n');
+      styleEl.textContent = desiredCss;
       (document.head || document.documentElement).appendChild(styleEl);
+    } else if (styleEl.textContent !== desiredCss) {
+      styleEl.textContent = desiredCss;
     }
     document.documentElement.setAttribute('data-agy-thought-lang', currentLang);
   }
