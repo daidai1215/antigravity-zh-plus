@@ -6,11 +6,19 @@ param(
 
     [string]$InstallDir = '',
 
-    [ValidateSet('', 'auto', 'google-free', 'gemini')]
+    [ValidateSet('', 'auto', 'free-direct', 'google-free', 'zhipu', 'openai-compat', 'gemini')]
     [string]$Provider = '',
 
     [ValidateSet('', 'true', 'false')]
     [string]$ThoughtEnabled = '',
+
+    [string]$LlmApiKeyEnv = '',
+
+    [string]$LlmBaseUrl = '',
+
+    [string]$LlmModel = '',
+
+    [switch]$ClearLlmApiKey,
 
     [string]$GeminiModel = '',
 
@@ -79,6 +87,7 @@ $KnownOwnedFiles = @(
     'launch-hans.vbs',
     'update-hans.ps1',
     'build-overlay.ps1',
+    'local-bridge.ps1',
     'thought-addon.js',
     'thought-config.json',
     'antigravity-hans-windows-amd64.exe',
@@ -271,6 +280,7 @@ function Deploy-RuntimeFiles {
         'launch-hans.ps1',
         'update-hans.ps1',
         'build-overlay.ps1',
+        'local-bridge.ps1',
         'thought-addon.js',
         'thought-config.default.json',
         'launch-hans.vbs'
@@ -313,7 +323,7 @@ function Deploy-RuntimeFiles {
         } | ConvertTo-Json -Depth 2)
         Write-TextAtomically -Path (Join-Path $InstallDir $OwnershipMarkerName) -Content $markerJson -Encoding $Utf8NoBom
 
-        foreach ($psName in @('launch-hans.ps1', 'update-hans.ps1', 'build-overlay.ps1')) {
+        foreach ($psName in @('launch-hans.ps1', 'update-hans.ps1', 'build-overlay.ps1', 'local-bridge.ps1')) {
             Write-TextAtomically -Path (Join-Path $InstallDir $psName) -Content $payloadMap[$psName] -Encoding $Utf8Bom
         }
 
@@ -381,6 +391,9 @@ function Get-StructuredState {
         configError = ''
         enabled     = $false
         provider    = 'auto'
+        bridgePort  = 47831
+        hasLlmKey   = $false
+        llmModel    = 'glm-4-flash'
         hasApiKey   = $false
         geminiModel = 'gemini-3.5-flash-lite'
     }
@@ -401,6 +414,18 @@ function Get-StructuredState {
                 }
                 if ($null -ne $parsed.PSObject.Properties['provider'] -and $null -ne $parsed.provider) {
                     $cfgSummary.provider = ([string]$parsed.provider).Trim().ToLowerInvariant()
+                }
+                if ($null -ne $parsed.PSObject.Properties['bridgePort'] -and $null -ne $parsed.bridgePort) {
+                    $bpTmp = 0
+                    if ([int]::TryParse([string]$parsed.bridgePort, [ref]$bpTmp) -and $bpTmp -ge 1024 -and $bpTmp -le 65535) {
+                        $cfgSummary.bridgePort = $bpTmp
+                    }
+                }
+                if ($null -ne $parsed.PSObject.Properties['llmApiKey'] -and $null -ne $parsed.llmApiKey) {
+                    $cfgSummary.hasLlmKey = (-not [string]::IsNullOrWhiteSpace([string]$parsed.llmApiKey))
+                }
+                if ($null -ne $parsed.PSObject.Properties['llmModel'] -and -not [string]::IsNullOrWhiteSpace([string]$parsed.llmModel)) {
+                    $cfgSummary.llmModel = ([string]$parsed.llmModel).Trim()
                 }
                 if ($null -ne $parsed.PSObject.Properties['geminiApiKey'] -and $null -ne $parsed.geminiApiKey) {
                     $cfgSummary.hasApiKey = (-not [string]::IsNullOrWhiteSpace([string]$parsed.geminiApiKey))
@@ -449,6 +474,11 @@ function Update-ProviderConfigUnderLock {
         $cfg = [ordered]@{
             enabled      = $true
             provider     = 'auto'
+            bridgePort   = 47831
+            bridgeToken  = ''
+            llmApiKey    = ''
+            llmBaseUrl   = 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+            llmModel     = 'glm-4-flash'
             geminiApiKey = ''
             geminiModel  = 'gemini-3.5-flash-lite'
         }
@@ -487,6 +517,39 @@ function Update-ProviderConfigUnderLock {
 
         if (-not [string]::IsNullOrWhiteSpace($Provider)) {
             $cfg['provider'] = $Provider.ToLowerInvariant()
+            if ($cfg['provider'] -eq 'zhipu') {
+                if ([string]::IsNullOrWhiteSpace($LlmBaseUrl)) {
+                    $cfg['llmBaseUrl'] = 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+                }
+                if ([string]::IsNullOrWhiteSpace($LlmModel)) {
+                    $cfg['llmModel'] = 'glm-4-flash'
+                }
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($LlmBaseUrl)) {
+            $trimmedUrl = $LlmBaseUrl.Trim()
+            $uObj = $null
+            if (-not [Uri]::TryCreate($trimmedUrl, [UriKind]::Absolute, [ref]$uObj) -or
+                ($uObj.Scheme -ne 'https' -and -not ($uObj.Scheme -eq 'http' -and $uObj.Host -in @('127.0.0.1', 'localhost')))) {
+                throw "LlmBaseUrl must use https:// (or http:// only for 127.0.0.1/localhost): $trimmedUrl"
+            }
+            $cfg['llmBaseUrl'] = $trimmedUrl
+        }
+        if (-not [string]::IsNullOrWhiteSpace($LlmModel)) {
+            $cfg['llmModel'] = $LlmModel.Trim()
+        }
+        if ($ClearLlmApiKey) {
+            $cfg['llmApiKey'] = ''
+            if ($cfg['provider'] -in @('zhipu', 'openai-compat')) { $cfg['provider'] = 'auto' }
+        } elseif (-not [string]::IsNullOrWhiteSpace($LlmApiKeyEnv)) {
+            $llmVal = [Environment]::GetEnvironmentVariable($LlmApiKeyEnv)
+            if ([string]::IsNullOrWhiteSpace($llmVal)) {
+                throw "Environment variable '$LlmApiKeyEnv' is empty or not set."
+            }
+            $cfg['llmApiKey'] = $llmVal.Trim()
+            if ([string]::IsNullOrWhiteSpace($Provider)) {
+                $cfg['provider'] = if ([string]$cfg['llmBaseUrl'] -match 'bigmodel\.cn') { 'zhipu' } else { 'openai-compat' }
+            }
         }
         if ($HasExplicitGeminiModel -and -not [string]::IsNullOrWhiteSpace($GeminiModel)) {
             $cfg['geminiModel'] = $GeminiModel.Trim()
@@ -529,6 +592,10 @@ try {
 
             if (-not [string]::IsNullOrWhiteSpace($Provider) -or
                 -not [string]::IsNullOrWhiteSpace($ThoughtEnabled) -or
+                -not [string]::IsNullOrWhiteSpace($LlmApiKeyEnv) -or
+                -not [string]::IsNullOrWhiteSpace($LlmBaseUrl) -or
+                -not [string]::IsNullOrWhiteSpace($LlmModel) -or
+                $ClearLlmApiKey -or
                 -not [string]::IsNullOrWhiteSpace($GeminiApiKeyEnv) -or
                 $ClearGeminiApiKey -or
                 $HasExplicitModel) {

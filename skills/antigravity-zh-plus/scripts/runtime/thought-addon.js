@@ -20,6 +20,10 @@
   const CONFIG = Object.assign({
     enabled: true,
     provider: 'auto',
+    bridgePort: 47831,
+    bridgeToken: '',
+    hasLlmKey: false,
+    llmModel: 'glm-4-flash',
     geminiApiKey: '',
     geminiModel: 'gemini-3.5-flash-lite',
     _buildId: 'dev'
@@ -28,7 +32,7 @@
   const normalizedProvider = String(CONFIG.provider || 'auto').trim().toLowerCase();
   const ADDON_FINGERPRINT =
     String(window.__antigravityZhPatchRequestedFingerprint || 'ext') +
-    '|thought-v5|' +
+    '|thought-v7|' +
     String(CONFIG._buildId || '') +
     '|' +
     String(Boolean(CONFIG.enabled)) +
@@ -472,17 +476,20 @@
     if (!translatedText) return false;
     if (tokenCount === 0) return true;
     const re = buildTokenRegex(prefix);
-    const seen = new Set();
+    const counts = new Map();
     let m;
     while ((m = re.exec(translatedText)) !== null) {
       const idx = parseInt(m[1], 10);
       if (Number.isNaN(idx) || idx < 0 || idx >= tokenCount) {
         return false;
       }
-      seen.add(idx);
+      counts.set(idx, (counts.get(idx) || 0) + 1);
     }
-    if (strictAllPresent && seen.size !== tokenCount) {
-      return false;
+    if (strictAllPresent) {
+      if (counts.size !== tokenCount) return false;
+      for (let i = 0; i < tokenCount; i++) {
+        if (counts.get(i) !== 1) return false;
+      }
     }
     return true;
   }
@@ -793,10 +800,53 @@
     return out;
   }
 
+  let bridgeCooldownUntil = 0;
+  const BRIDGE_RETRY_COOLDOWN_MS = 8000;
+
+  async function translateBatchViaLocalBridge(maskedTexts) {
+    const token = String(CONFIG.bridgeToken || '').trim();
+    const port = Number(CONFIG.bridgePort) || 47831;
+    if (!token || port < 1024 || port > 65535 || !isVerifiedAgAppSurface()) {
+      throw new Error('Local bridge not configured');
+    }
+    if (Date.now() < bridgeCooldownUntil) {
+      throw new Error('Local bridge cooling down');
+    }
+    try {
+      const data = await fetchJsonWithTimeout('http://127.0.0.1:' + port + '/translate', {
+        method: 'POST',
+        credentials: 'omit',
+        referrerPolicy: 'no-referrer',
+        headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+        body: JSON.stringify({
+          token: token,
+          texts: maskedTexts
+        })
+      }, 24000);
+      if (!data || data.ok !== true || !Array.isArray(data.translations) || data.translations.length !== maskedTexts.length) {
+        throw new Error((data && data.error) ? String(data.error) : 'Invalid bridge payload');
+      }
+      bridgeCooldownUntil = 0;
+      return {
+        engine: typeof data.engine === 'string' ? data.engine : 'transmart-direct',
+        translations: data.translations.map(s => (typeof s === 'string' ? s.trim() : ''))
+      };
+    } catch (err) {
+      bridgeCooldownUntil = Date.now() + BRIDGE_RETRY_COOLDOWN_MS;
+      throw err;
+    }
+  }
+
   function getActiveProviderTag() {
-    const hasKey = Boolean(String(CONFIG.geminiApiKey || '').trim());
-    const useGemini = hasKey && normalizedProvider !== 'google-free' && isVerifiedAgAppSurface();
-    return useGemini ? ('gemini:' + (String(CONFIG.geminiModel || 'gemini-3.5-flash-lite').trim() || 'gemini-3.5-flash-lite')) : 'gtx';
+    const buildVer = String(CONFIG._buildId || 'dev').slice(0, 8);
+    if (Boolean(CONFIG.hasLlmKey) && (normalizedProvider === 'auto' || normalizedProvider === 'zhipu' || normalizedProvider === 'openai-compat')) {
+      return 'llm:' + normalizedProvider + ':' + (String(CONFIG.llmModel || 'glm-4-flash').trim() || 'glm-4-flash') + ':' + buildVer;
+    }
+    const hasGemKey = Boolean(String(CONFIG.geminiApiKey || '').trim());
+    if (hasGemKey && (normalizedProvider === 'auto' || normalizedProvider === 'gemini') && isVerifiedAgAppSurface()) {
+      return 'gemini:' + (String(CONFIG.geminiModel || 'gemini-3.5-flash-lite').trim() || 'gemini-3.5-flash-lite') + ':' + buildVer;
+    }
+    return 'direct:' + buildVer;
   }
 
   function pumpQueue() {
@@ -817,7 +867,7 @@
     }
   }
 
-  function enqueueBlockTranslation(blockEl, payload, providerTag) {
+  async function translateSingleItemDirect(payload, providerTag) {
     const { prefix, masked, tokens } = payload;
     const tokenCount = tokens.length;
     const useGemini = providerTag.startsWith('gemini:');
@@ -825,80 +875,45 @@
 
     const hit = cacheGet(cacheKey);
     if (hit !== null && validatePlaceholders(hit, prefix, tokenCount, false)) {
-      return Promise.resolve(hit);
+      return hit;
     }
 
     if (inflightMap.has(cacheKey)) {
-      const existing = inflightMap.get(cacheKey);
-      existing.subscribers.add(blockEl);
-      return existing.promise;
+      return inflightMap.get(cacheKey);
     }
 
-    const subscribers = new Set([blockEl]);
-    const hasLiveSubscriber = () => {
-      if (disposed || currentLang !== 'zh') return false;
-      for (const b of Array.from(subscribers)) {
-        if (!b.isConnected) {
-          subscribers.delete(b);
-          continue;
-        }
-        const st = pendingBlockMap.get(b);
-        if (st && st.cacheKey === cacheKey) {
-          return true;
-        }
-      }
-      return false;
-    };
-
-    let jobRef = null;
-    const promise = new Promise((resolve, reject) => {
-      while (requestQueue.length >= MAX_QUEUE_LENGTH) {
-        const dropped = requestQueue.shift();
-        if (dropped) dropped.resolve('');
-      }
-      jobRef = {
-        cacheKey,
-        subscribers,
-        hasLiveSubscriber,
-        resolve,
-        reject,
-        fn: async () => {
-          if (disposed || !hasLiveSubscriber()) return '';
-          let translated = '';
-          if (useGemini) {
-            try {
-              const cand = await translateViaOfficialGeminiApi(masked, prefix, tokenCount);
-              if (validatePlaceholders(cand, prefix, tokenCount, true)) {
-                translated = cand;
-                cacheSet(cacheKey, translated);
-              } else {
-                throw new Error('Gemini placeholder mismatch');
-              }
-            } catch (_err) {
-              const fb = await translateViaFreeCascade(masked, prefix, tokenCount);
-              if (validatePlaceholders(fb, prefix, tokenCount, false)) {
-                translated = fb;
-                cacheSet('gtx|' + prefix + '|' + masked, translated);
-              }
-            }
-          } else {
-            const fb = await translateViaFreeCascade(masked, prefix, tokenCount);
-            if (validatePlaceholders(fb, prefix, tokenCount, false)) {
-              translated = fb;
-              cacheSet(cacheKey, translated);
-            }
+    const workPromise = (async () => {
+      if (disposed) return '';
+      if (useGemini) {
+        try {
+          const cand = await translateViaOfficialGeminiApi(masked, prefix, tokenCount);
+          if (validatePlaceholders(cand, prefix, tokenCount, true)) {
+            cacheSet(cacheKey, cand);
+            return cand;
           }
-          return translated;
+          throw new Error('Gemini placeholder mismatch');
+        } catch (_err) {
+          const fb = await translateViaFreeCascade(masked, prefix, tokenCount);
+          if (validatePlaceholders(fb, prefix, tokenCount, false)) {
+            cacheSet('direct|' + prefix + '|' + masked, fb);
+            return fb;
+          }
+          return '';
         }
-      };
-      requestQueue.push(jobRef);
-      pumpQueue();
-    }).finally(() => {
+      } else {
+        const fb = await translateViaFreeCascade(masked, prefix, tokenCount);
+        if (validatePlaceholders(fb, prefix, tokenCount, false)) {
+          cacheSet(cacheKey, fb);
+          return fb;
+        }
+        return '';
+      }
+    })().finally(() => {
       inflightMap.delete(cacheKey);
     });
 
-    inflightMap.set(cacheKey, { promise, subscribers });
-    return promise;
+    inflightMap.set(cacheKey, workPromise);
+    return workPromise;
   }
 
   function removeDirectThoughtSpan(blockEl) {
@@ -980,12 +995,119 @@
   }
 
   let nextJobSeq = 1;
+  const MAX_BATCH_PARAGRAPHS = 8;
+  const MAX_BATCH_TOTAL_CHARS = 9000;
+
+  function applyResolvedTranslationToItem(item, zhText, providerTag) {
+    if (disposed || !zhText || !item.block.isConnected || currentLang !== 'zh') return;
+    const active = pendingBlockMap.get(item.block);
+    if (!active || active.jobId !== item.jobId) return;
+    const latest = extractBlockMaskedPayload(item.block);
+    if (!latest.shouldTranslate || latest.masked !== item.payload.masked || latest.prefix !== item.payload.prefix) return;
+    const latestSig = providerTag + '|' + latest.prefix + '|' + latest.masked + '|' + JSON.stringify(latest.tokens);
+    renderBilingualSpan(item.block, zhText, latest.prefix, latest.tokens, latestSig);
+  }
+
+  function enqueueParagraphBatch(batchItems, providerTag) {
+    if (!batchItems || batchItems.length === 0) return;
+
+    const hasLiveSubscriber = () => {
+      if (disposed || currentLang !== 'zh') return false;
+      for (const it of batchItems) {
+        if (!it.block.isConnected) continue;
+        const st = pendingBlockMap.get(it.block);
+        if (st && st.jobId === it.jobId) return true;
+      }
+      return false;
+    };
+
+    while (requestQueue.length >= MAX_QUEUE_LENGTH) {
+      const dropped = requestQueue.shift();
+      if (dropped) dropped.resolve('');
+    }
+
+    new Promise((resolve, reject) => {
+      requestQueue.push({
+        hasLiveSubscriber,
+        resolve,
+        reject,
+        fn: async () => {
+          if (disposed || !hasLiveSubscriber()) return '';
+
+          const liveItems = [];
+          for (const it of batchItems) {
+            if (!it.block.isConnected) continue;
+            const st = pendingBlockMap.get(it.block);
+            if (!st || st.jobId !== it.jobId) continue;
+            const cached = cacheGet(it.cacheKey);
+            if (cached !== null && validatePlaceholders(cached, it.payload.prefix, it.payload.tokens.length, false)) {
+              applyResolvedTranslationToItem(it, cached, providerTag);
+              continue;
+            }
+            liveItems.push(it);
+          }
+
+          if (liveItems.length === 0) return '';
+
+          let fallbackItems = [];
+          try {
+            const bridgeRes = await translateBatchViaLocalBridge(liveItems.map(x => x.payload.masked));
+            const bridgeEngine = bridgeRes.engine || 'transmart-direct';
+            const bridgeTranslations = bridgeRes.translations;
+            const expectsConfiguredModel = providerTag.startsWith('llm:') || providerTag.startsWith('gemini:');
+            const usedFreeFallbackOnBridge = expectsConfiguredModel && bridgeEngine === 'transmart-direct';
+
+            for (let i = 0; i < liveItems.length; i++) {
+              const it = liveItems[i];
+              const tr = bridgeTranslations[i] || '';
+              if (tr && validatePlaceholders(tr, it.payload.prefix, it.payload.tokens.length, true)) {
+                if (!usedFreeFallbackOnBridge) {
+                  cacheSet(it.cacheKey, tr);
+                }
+                applyResolvedTranslationToItem(it, tr, providerTag);
+              } else {
+                fallbackItems.push(it);
+              }
+            }
+          } catch (_bridgeErr) {
+            fallbackItems = liveItems;
+          }
+
+          // Seamless browser-direct fallback if local bridge is temporarily unavailable or an item missed validation
+          for (const it of fallbackItems) {
+            if (disposed) break;
+            const st = pendingBlockMap.get(it.block);
+            if (!it.block.isConnected || !st || st.jobId !== it.jobId) continue;
+            try {
+              const tr = await translateSingleItemDirect(it.payload, providerTag);
+              if (tr) {
+                applyResolvedTranslationToItem(it, tr, providerTag);
+              }
+            } catch (_e) {}
+          }
+          return 'ok';
+        }
+      });
+      pumpQueue();
+    })
+      .catch(() => {})
+      .finally(() => {
+        for (const it of batchItems) {
+          const active = pendingBlockMap.get(it.block);
+          if (active && active.jobId === it.jobId) {
+            pendingBlockMap.delete(it.block);
+          }
+        }
+      });
+  }
 
   function processThinkingMarkdownRoot(mdRoot) {
     if (disposed || currentLang !== 'zh' || !mdRoot || !mdRoot.isConnected) return;
 
     const providerTag = getActiveProviderTag();
     const blocks = mdRoot.querySelectorAll('p, li, h1, h2, h3, h4, h5, h6');
+    const uncachedItems = [];
+
     for (const block of blocks) {
       if (block.closest('pre, code, table, [data-agy-zh-thought]')) continue;
       if (block.tagName === 'LI' && block.querySelector('p, h1, h2, h3, h4, h5, h6')) continue;
@@ -1004,6 +1126,14 @@
         continue;
       }
 
+      // Instant 0ms synchronous cache hit before queueing any network job
+      const memHit = cacheGet(cacheKey);
+      if (memHit !== null && validatePlaceholders(memHit, payload.prefix, payload.tokens.length, false)) {
+        pendingBlockMap.delete(block);
+        renderBilingualSpan(block, memHit, payload.prefix, payload.tokens, renderSig);
+        continue;
+      }
+
       const curPending = pendingBlockMap.get(block);
       if (curPending && curPending.renderSig === renderSig) {
         continue;
@@ -1011,24 +1141,26 @@
 
       const jobId = nextJobSeq++;
       pendingBlockMap.set(block, { jobId, cacheKey, renderSig });
+      uncachedItems.push({ block, payload, cacheKey, renderSig, jobId });
+    }
 
-      enqueueBlockTranslation(block, payload, providerTag)
-        .then(zhText => {
-          if (disposed || !zhText || !block.isConnected || currentLang !== 'zh') return;
-          const active = pendingBlockMap.get(block);
-          if (!active || active.jobId !== jobId) return;
-          const latest = extractBlockMaskedPayload(block);
-          if (!latest.shouldTranslate || latest.masked !== payload.masked || latest.prefix !== payload.prefix) return;
-          const latestSig = providerTag + '|' + latest.prefix + '|' + latest.masked + '|' + JSON.stringify(latest.tokens);
-          renderBilingualSpan(block, zhText, latest.prefix, latest.tokens, latestSig);
-        })
-        .catch(() => {})
-        .finally(() => {
-          const active = pendingBlockMap.get(block);
-          if (active && active.jobId === jobId) {
-            pendingBlockMap.delete(block);
-          }
-        });
+    if (uncachedItems.length === 0) return;
+
+    // Group uncached paragraphs into bounded multi-paragraph batches (cuts HTTP calls by ~75%)
+    let curBatch = [];
+    let curChars = 0;
+    for (const item of uncachedItems) {
+      const len = item.payload.masked.length;
+      if (curBatch.length >= MAX_BATCH_PARAGRAPHS || (curBatch.length > 0 && (curChars + len) > MAX_BATCH_TOTAL_CHARS)) {
+        enqueueParagraphBatch(curBatch, providerTag);
+        curBatch = [];
+        curChars = 0;
+      }
+      curBatch.push(item);
+      curChars += len;
+    }
+    if (curBatch.length > 0) {
+      enqueueParagraphBatch(curBatch, providerTag);
     }
   }
 

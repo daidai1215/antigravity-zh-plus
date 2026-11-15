@@ -14,6 +14,8 @@ $ConfigPath = Join-Path $ToolDir 'thought-config.json'
 $AddonPath = Join-Path $ToolDir 'thought-addon.js'
 $OverlayPath = Join-Path $ToolDir 'antigravity-hans-overlay.js'
 $OverlayMetaPath = Join-Path $ToolDir 'antigravity-hans-overlay.meta.json'
+$StateDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'antigravity-hans-guard'
+$BridgeEndpointFile = Join-Path $StateDir 'bridge-endpoint.json'
 $LauncherMutexName = 'Local\AntigravityHansLauncherMutex'
 
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -69,6 +71,17 @@ function Get-StringSha256Hex {
     }
 }
 
+function New-RandomBridgeToken {
+    $bytes = New-Object byte[] 16
+    $rng = [System.Security.Cryptography.RNGCryptoServiceProvider]::Create()
+    try {
+        $rng.GetBytes($bytes)
+        return ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+    } finally {
+        $rng.Dispose()
+    }
+}
+
 $Mutex = $null
 $HasMutex = $false
 if (-not $CallerHoldsMutex) {
@@ -93,15 +106,19 @@ try {
     }
 
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
-        $defaultCfgText = @'
-{
-  "enabled": true,
-  "provider": "auto",
-  "geminiApiKey": "",
-  "geminiModel": "gemini-3.5-flash-lite"
-}
-'@
-        Write-FileAtomically -TargetPath $ConfigPath -Content $defaultCfgText -Encoding $Utf8NoBom
+        $initToken = New-RandomBridgeToken
+        $defaultCfgObj = [ordered]@{
+            enabled      = $true
+            provider     = 'auto'
+            bridgePort   = 47831
+            bridgeToken  = $initToken
+            llmApiKey    = ''
+            llmBaseUrl   = 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+            llmModel     = 'glm-4-flash'
+            geminiApiKey = ''
+            geminiModel  = 'gemini-3.5-flash-lite'
+        }
+        Write-FileAtomically -TargetPath $ConfigPath -Content ($defaultCfgObj | ConvertTo-Json -Depth 4) -Encoding $Utf8NoBom
     }
 
     $rawCfgText = [IO.File]::ReadAllText($ConfigPath, $Utf8Strict)
@@ -121,27 +138,77 @@ try {
     } else {
         'auto'
     }
-    if ($normProvider -notin @('auto', 'google-free', 'gemini')) {
-        throw "thought-config.json 字段 'provider' 非法: $normProvider (仅支持 auto / google-free / gemini)。"
+    $allowedProviders = @('auto', 'free-direct', 'google-free', 'zhipu', 'openai-compat', 'gemini')
+    if ($normProvider -notin $allowedProviders) {
+        throw "thought-config.json 字段 'provider' 非法: $normProvider (支持: $($allowedProviders -join ' / '))。"
     }
 
-    $storedApiKey = if ($null -ne $parsedCfg.PSObject.Properties['geminiApiKey'] -and $null -ne $parsedCfg.geminiApiKey) {
-        ([string]$parsedCfg.geminiApiKey).Trim()
+    $cfgPort = 47831
+    if ($null -ne $parsedCfg.PSObject.Properties['bridgePort'] -and $null -ne $parsedCfg.bridgePort) {
+        $tmpP = 0
+        if ([int]::TryParse([string]$parsedCfg.bridgePort, [ref]$tmpP) -and $tmpP -ge 1024 -and $tmpP -le 65535) {
+            $cfgPort = $tmpP
+        }
+    }
+
+    $cfgToken = if ($null -ne $parsedCfg.PSObject.Properties['bridgeToken'] -and $null -ne $parsedCfg.bridgeToken) {
+        ([string]$parsedCfg.bridgeToken).Trim()
     } else {
         ''
     }
 
-    $normModel = if ($null -ne $parsedCfg.PSObject.Properties['geminiModel'] -and $null -ne $parsedCfg.geminiModel) {
+    # Ensure persistent bridgeToken exists in thought-config.json so overlay & local-bridge share the exact token
+    if ([string]::IsNullOrWhiteSpace($cfgToken) -or $cfgToken.Length -lt 24) {
+        $cfgToken = New-RandomBridgeToken
+        $updatedMap = [ordered]@{}
+        foreach ($prop in $parsedCfg.PSObject.Properties) {
+            $updatedMap[$prop.Name] = $prop.Value
+        }
+        $updatedMap['bridgePort'] = $cfgPort
+        $updatedMap['bridgeToken'] = $cfgToken
+        Write-FileAtomically -TargetPath $ConfigPath -Content ($updatedMap | ConvertTo-Json -Depth 6) -Encoding $Utf8NoBom
+    }
+
+    # If running bridge bound a fallback port, prefer live endpoint port
+    $effectiveBridgePort = $cfgPort
+    if (Test-Path -LiteralPath $BridgeEndpointFile -PathType Leaf) {
+        try {
+            $ep = ([IO.File]::ReadAllText($BridgeEndpointFile, [Text.Encoding]::UTF8)) | ConvertFrom-Json
+            if ($null -ne $ep -and $null -ne $ep.PSObject.Properties['port']) {
+                $liveP = [int]$ep.port
+                if ($liveP -ge 1024 -and $liveP -le 65535) {
+                    $effectiveBridgePort = $liveP
+                }
+            }
+        } catch {}
+    }
+
+    $storedLlmKey = if ($null -ne $parsedCfg.PSObject.Properties['llmApiKey'] -and $null -ne $parsedCfg.llmApiKey) {
+        ([string]$parsedCfg.llmApiKey).Trim()
+    } else {
+        ''
+    }
+    $normLlmModel = if ($null -ne $parsedCfg.PSObject.Properties['llmModel'] -and $null -ne $parsedCfg.llmModel -and -not [string]::IsNullOrWhiteSpace([string]$parsedCfg.llmModel)) {
+        ([string]$parsedCfg.llmModel).Trim()
+    } else {
+        'glm-4-flash'
+    }
+
+    $storedGemKey = if ($null -ne $parsedCfg.PSObject.Properties['geminiApiKey'] -and $null -ne $parsedCfg.geminiApiKey) {
+        ([string]$parsedCfg.geminiApiKey).Trim()
+    } else {
+        ''
+    }
+    $normGemModel = if ($null -ne $parsedCfg.PSObject.Properties['geminiModel'] -and $null -ne $parsedCfg.geminiModel -and -not [string]::IsNullOrWhiteSpace([string]$parsedCfg.geminiModel)) {
         ([string]$parsedCfg.geminiModel).Trim()
     } else {
         'gemini-3.5-flash-lite'
     }
-    if ([string]::IsNullOrWhiteSpace($normModel)) {
-        $normModel = 'gemini-3.5-flash-lite'
-    }
 
-    # Minimize secret exposure: never embed geminiApiKey into overlay when disabled or forced to google-free
-    $effectiveApiKey = if ($normEnabled -and $normProvider -ne 'google-free') { $storedApiKey } else { '' }
+    # Never embed llmApiKey into JS overlay (local-bridge reads it directly on disk); only embed geminiApiKey when browser direct fallback may need it
+    $effectiveGemKey = if ($normEnabled -and $normProvider -in @('auto', 'gemini')) { $storedGemKey } else { '' }
+    $effectiveBridgeToken = if ($normEnabled) { $cfgToken } else { '' }
+    $hasLlmKeyFlag = ($normEnabled -and (-not [string]::IsNullOrWhiteSpace($storedLlmKey)) -and $normProvider -notin @('free-direct', 'google-free', 'gemini'))
 
     # 2. Strictly extract unique official embedded overlay.js from antigravity-hans-windows-amd64.exe
     $exeBytes = [IO.File]::ReadAllBytes($ExePath)
@@ -228,13 +295,17 @@ try {
     $exeSha = (Get-FileHash -LiteralPath $ExePath -Algorithm SHA256).Hash.ToLowerInvariant()
     $addonSha = (Get-FileHash -LiteralPath $AddonPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $cfgSha = (Get-FileHash -LiteralPath $ConfigPath -Algorithm SHA256).Hash.ToLowerInvariant()
-    $buildId = (Get-StringSha256Hex -Text "$exeSha|$addonSha|$cfgSha").Substring(0, 16)
+    $buildId = (Get-StringSha256Hex -Text "$exeSha|$addonSha|$cfgSha|$effectiveBridgePort").Substring(0, 16)
 
     $cfgOrdered = [ordered]@{
         enabled      = $normEnabled
         provider     = $normProvider
-        geminiApiKey = $effectiveApiKey
-        geminiModel  = $normModel
+        bridgePort   = $effectiveBridgePort
+        bridgeToken  = $effectiveBridgeToken
+        hasLlmKey    = $hasLlmKeyFlag
+        llmModel     = $normLlmModel
+        geminiApiKey = $effectiveGemKey
+        geminiModel  = $normGemModel
         _buildId     = $buildId
     }
     $cfgCompressed = ($cfgOrdered | ConvertTo-Json -Compress).Replace('</', '<\/')
@@ -249,6 +320,7 @@ try {
         exeSha     = $exeSha
         addonSha   = $addonSha
         configSha  = $cfgSha
+        bridgePort = $effectiveBridgePort
         overlaySha = $overlaySha
         builtUtc   = [DateTime]::UtcNow.ToString('o')
     }) | ConvertTo-Json -Depth 4
@@ -257,10 +329,12 @@ try {
     if (-not $Quiet) {
         $provDesc = if (-not $normEnabled) {
             '已关闭 (仅基础界面汉化)'
-        } elseif (-not [string]::IsNullOrWhiteSpace($effectiveApiKey)) {
-            "官方 Gemini API ($normModel)"
+        } elseif ($hasLlmKeyFlag) {
+            "独立大模型 API ($normProvider / $normLlmModel)"
+        } elseif (-not [string]::IsNullOrWhiteSpace($effectiveGemKey)) {
+            "官方 Gemini API ($normGemModel)"
         } else {
-            '免Key网页翻译 (translate.googleapis.com)'
+            "本地免代理直连多段打包 (127.0.0.1:$effectiveBridgePort -> 腾讯 TranSmart)"
         }
         Write-Host "[完成] 已合成外部汉化与思考翻译脚本: antigravity-hans-overlay.js (SHA-256 前缀: $($overlaySha.Substring(0, 16)) | buildId: $buildId | 状态: $provDesc)"
     }

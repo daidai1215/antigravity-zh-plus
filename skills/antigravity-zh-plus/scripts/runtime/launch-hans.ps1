@@ -16,6 +16,7 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
+$GuardRuntimeVersion = '1.1.0'
 $ToolDir = $PSScriptRoot
 $HansExeName = 'antigravity-hans-windows-amd64.exe'
 $HansExePath = Join-Path $ToolDir $HansExeName
@@ -25,6 +26,7 @@ $OverlayJsPath = Join-Path $ToolDir 'antigravity-hans-overlay.js'
 $OverlayMetaPath = Join-Path $ToolDir 'antigravity-hans-overlay.meta.json'
 $ThoughtCfgPath = Join-Path $ToolDir 'thought-config.json'
 $ThoughtAddonPath = Join-Path $ToolDir 'thought-addon.js'
+$LocalBridgePs1 = Join-Path $ToolDir 'local-bridge.ps1'
 $WscriptPath = Join-Path ([Environment]::SystemDirectory) 'wscript.exe'
 $PowerShellExe = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
 if (-not (Test-Path -LiteralPath $PowerShellExe -PathType Leaf)) {
@@ -38,6 +40,9 @@ if (-not (Test-Path -LiteralPath $StateDir -PathType Container)) {
 $LogPath = Join-Path $StateDir 'launcher.log'
 $GuardDisabledFlag = Join-Path $StateDir 'auto-guard.disabled'
 $StopSignalFile = Join-Path $StateDir 'watch-stop.signal'
+$WatchEndpointFile = Join-Path $StateDir 'watch-endpoint.json'
+$BridgeStopSignalFile = Join-Path $StateDir 'bridge-stop.signal'
+$BridgeEndpointFile = Join-Path $StateDir 'bridge-endpoint.json'
 $LastSpawnFile = Join-Path $StateDir 'last-spawn.json'
 
 $DevToolsPortFile = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'Antigravity\DevToolsActivePort'
@@ -51,6 +56,8 @@ $UpdaterMutexName = 'Local\AntigravityHansUpdaterMutex'
 $LauncherMutexName = 'Local\AntigravityHansLauncherMutex'
 $WatchMutexName = 'Local\AntigravityHansWatchMutex'
 $WatchStopEventName = 'Local\AntigravityHansWatchStopEvent'
+$BridgeMutexName = 'Local\AntigravityHansBridgeMutex'
+$BridgeStopEventName = 'Local\AntigravityHansBridgeStopEvent'
 
 function Write-LauncherLog {
     param(
@@ -642,6 +649,11 @@ function Read-ThoughtConfigNormalized {
     $defaults = [ordered]@{
         enabled      = $true
         provider     = 'auto'
+        bridgePort   = 47831
+        bridgeToken  = ''
+        llmApiKey    = ''
+        llmBaseUrl   = 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+        llmModel     = 'glm-4-flash'
         geminiApiKey = ''
         geminiModel  = 'gemini-3.5-flash-lite'
     }
@@ -659,23 +671,49 @@ function Read-ThoughtConfigNormalized {
         if ($null -eq $obj -or ($obj -is [Array]) -or ($obj -is [ValueType]) -or ($obj -is [string])) {
             throw "thought-config.json 根节点不是 JSON 对象。"
         }
+        foreach ($prop in $obj.PSObject.Properties) {
+            $defaults[$prop.Name] = $prop.Value
+        }
         if ($null -ne $obj.PSObject.Properties['enabled'] -and $null -ne $obj.enabled) {
-            $defaults.enabled = ConvertTo-StrictBoolValue -Value $obj.enabled -DefaultVal $true
+            $defaults['enabled'] = ConvertTo-StrictBoolValue -Value $obj.enabled -DefaultVal $true
+        } else {
+            $defaults['enabled'] = $true
         }
         if ($null -ne $obj.PSObject.Properties['provider'] -and $null -ne $obj.provider) {
             $pv = ([string]$obj.provider).Trim().ToLowerInvariant()
-            if ($pv -in @('auto', 'google-free', 'gemini')) {
-                $defaults.provider = $pv
+            if ($pv -in @('auto', 'free-direct', 'google-free', 'zhipu', 'openai-compat', 'gemini')) {
+                $defaults['provider'] = $pv
             } elseif ($Strict) {
                 throw "非法 provider: $pv"
+            } else {
+                $defaults['provider'] = 'auto'
             }
+        } else {
+            $defaults['provider'] = 'auto'
         }
-        if ($null -ne $obj.PSObject.Properties['geminiApiKey'] -and $null -ne $obj.geminiApiKey) {
-            $defaults.geminiApiKey = ([string]$obj.geminiApiKey).Trim()
+        $bp = 0
+        if ($null -ne $obj.PSObject.Properties['bridgePort'] -and [int]::TryParse([string]$obj.bridgePort, [ref]$bp) -and $bp -ge 1024 -and $bp -le 65535) {
+            $defaults['bridgePort'] = $bp
+        } else {
+            $defaults['bridgePort'] = 47831
         }
-        if ($null -ne $obj.PSObject.Properties['geminiModel'] -and $null -ne $obj.geminiModel) {
-            $mv = ([string]$obj.geminiModel).Trim()
-            if (-not [string]::IsNullOrWhiteSpace($mv)) { $defaults.geminiModel = $mv }
+        $defaults['bridgeToken'] = if ($null -ne $obj.PSObject.Properties['bridgeToken'] -and $null -ne $obj.bridgeToken) { ([string]$obj.bridgeToken).Trim() } else { '' }
+        $defaults['llmApiKey'] = if ($null -ne $obj.PSObject.Properties['llmApiKey'] -and $null -ne $obj.llmApiKey) { ([string]$obj.llmApiKey).Trim() } else { '' }
+        if ($null -ne $obj.PSObject.Properties['llmBaseUrl'] -and -not [string]::IsNullOrWhiteSpace([string]$obj.llmBaseUrl)) {
+            $defaults['llmBaseUrl'] = ([string]$obj.llmBaseUrl).Trim()
+        } else {
+            $defaults['llmBaseUrl'] = 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+        }
+        if ($null -ne $obj.PSObject.Properties['llmModel'] -and -not [string]::IsNullOrWhiteSpace([string]$obj.llmModel)) {
+            $defaults['llmModel'] = ([string]$obj.llmModel).Trim()
+        } else {
+            $defaults['llmModel'] = 'glm-4-flash'
+        }
+        $defaults['geminiApiKey'] = if ($null -ne $obj.PSObject.Properties['geminiApiKey'] -and $null -ne $obj.geminiApiKey) { ([string]$obj.geminiApiKey).Trim() } else { '' }
+        if ($null -ne $obj.PSObject.Properties['geminiModel'] -and -not [string]::IsNullOrWhiteSpace([string]$obj.geminiModel)) {
+            $defaults['geminiModel'] = ([string]$obj.geminiModel).Trim()
+        } else {
+            $defaults['geminiModel'] = 'gemini-3.5-flash-lite'
         }
         return $defaults
     } catch {
@@ -719,12 +757,19 @@ function Get-ThoughtTranslationSummary {
     if (-not $cfg.enabled) {
         return '已关闭 (仅基础界面汉化)'
     }
-    $hasKey = (-not [string]::IsNullOrWhiteSpace($cfg.geminiApiKey))
-    $srcDesc = if ($hasKey -and $cfg.provider -ne 'google-free') {
+    $hasLlmKey = (-not [string]::IsNullOrWhiteSpace($cfg.llmApiKey))
+    $hasGemKey = (-not [string]::IsNullOrWhiteSpace($cfg.geminiApiKey))
+    $pv = [string]$cfg.provider
+
+    $srcDesc = if ($hasLlmKey -and $pv -in @('zhipu', 'openai-compat', 'auto')) {
+        $tail = if ($cfg.llmApiKey.Length -ge 4) { $cfg.llmApiKey.Substring($cfg.llmApiKey.Length - 4) } else { '****' }
+        $label = if ($pv -eq 'zhipu' -or $cfg.llmBaseUrl -match 'bigmodel\.cn') { '智谱官方免费大模型' } else { '独立大模型 API' }
+        "$label ($($cfg.llmModel), Key 尾号: $tail, 异常自动回退本地直连桥)"
+    } elseif ($hasGemKey -and $pv -in @('gemini', 'auto')) {
         $tail = if ($cfg.geminiApiKey.Length -ge 4) { $cfg.geminiApiKey.Substring($cfg.geminiApiKey.Length - 4) } else { '****' }
-        "官方 Gemini API ($($cfg.geminiModel), Key 尾号: $tail)"
+        "官方 Gemini API ($($cfg.geminiModel), Key 尾号: $tail, 异常自动回退本地直连桥)"
     } else {
-        '免Key网页翻译 (translate.googleapis.com, POST 直连零反代风险)'
+        "免Key本地免代理直连 + 多段打包 (127.0.0.1:$($cfg.bridgePort) -> 腾讯 TranSmart, 防代理429)"
     }
     return "已启用 | 中英对照 | 翻译源: $srcDesc"
 }
@@ -1020,6 +1065,104 @@ function Set-StartupGuardRegistration {
     }
 }
 
+function Get-ActiveLocalBridgePort {
+    if (-not (Test-NamedMutexLocked -MutexName $BridgeMutexName)) {
+        return 0
+    }
+    if (Test-Path -LiteralPath $BridgeEndpointFile -PathType Leaf) {
+        try {
+            $ep = ([IO.File]::ReadAllText($BridgeEndpointFile, [Text.Encoding]::UTF8)) | ConvertFrom-Json
+            if ($null -ne $ep -and $null -ne $ep.PSObject.Properties['port']) {
+                return [int]$ep.port
+            }
+        } catch {}
+    }
+    $cfg = Read-ThoughtConfigNormalized
+    return $(if ($null -ne $cfg) { [int]$cfg.bridgePort } else { 47831 })
+}
+
+function Start-LocalBridgeIfNeeded {
+    if (-not (Test-Path -LiteralPath $LocalBridgePs1 -PathType Leaf)) {
+        return
+    }
+    $cfg = Read-ThoughtConfigNormalized
+    if ($null -ne $cfg -and -not $cfg.enabled) {
+        Stop-LocalBridge
+        return
+    }
+    if (Test-NamedMutexLocked -MutexName $BridgeMutexName) {
+        $sameVer = $false
+        if (Test-Path -LiteralPath $BridgeEndpointFile -PathType Leaf) {
+            try {
+                $ep = ([IO.File]::ReadAllText($BridgeEndpointFile, [Text.Encoding]::UTF8)) | ConvertFrom-Json
+                if ($null -ne $ep -and $null -ne $ep.PSObject.Properties['version'] -and [string]$ep.version -eq $GuardRuntimeVersion) {
+                    $sameVer = $true
+                }
+            } catch {}
+        }
+        if ($sameVer) { return }
+        Stop-LocalBridge
+    }
+    if (Test-Path -LiteralPath $BridgeStopSignalFile -PathType Leaf) {
+        Remove-Item -LiteralPath $BridgeStopSignalFile -Force -ErrorAction SilentlyContinue
+    }
+    $ev = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, $BridgeStopEventName)
+    try {
+        [void]$ev.Reset()
+    } finally {
+        $ev.Dispose()
+    }
+    $p = $null
+    try {
+        $p = Start-Process -FilePath $PowerShellExe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$LocalBridgePs1`"") -WorkingDirectory $ToolDir -WindowStyle Hidden -PassThru
+    } finally {
+        if ($null -ne $p) { $p.Dispose() }
+    }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt 5000) {
+        if ((Test-NamedMutexLocked -MutexName $BridgeMutexName) -and (Test-Path -LiteralPath $BridgeEndpointFile -PathType Leaf)) {
+            return
+        }
+        Start-Sleep -Milliseconds 120
+    }
+    throw "本地直连翻译桥启动未在 5 秒内就绪，请检查日志: $LogPath"
+}
+
+function Stop-LocalBridge {
+    [IO.File]::WriteAllText($BridgeStopSignalFile, 'stop', [Text.Encoding]::ASCII)
+    $ev = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, $BridgeStopEventName)
+    try {
+        [void]$ev.Set()
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($sw.ElapsedMilliseconds -lt 7000) {
+            if (-not (Test-NamedMutexLocked -MutexName $BridgeMutexName)) {
+                return
+            }
+            Start-Sleep -Milliseconds 120
+        }
+        # Fallback kill of lingering local-bridge.ps1 process owned by this ToolDir
+        try {
+            $procs = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue)
+            foreach ($pr in $procs) {
+                $cmd = [string]$pr.CommandLine
+                if (-not [string]::IsNullOrWhiteSpace($cmd) -and $cmd.IndexOf($LocalBridgePs1, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    Stop-Process -Id ([int]$pr.ProcessId) -Force -ErrorAction SilentlyContinue
+                }
+            }
+        } catch {}
+        $sw2 = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($sw2.ElapsedMilliseconds -lt 2500) {
+            if (-not (Test-NamedMutexLocked -MutexName $BridgeMutexName)) {
+                return
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        throw "等待本地直连翻译桥退出超时。"
+    } finally {
+        $ev.Dispose()
+    }
+}
+
 function Clear-WatchStopSignals {
     if (Test-Path -LiteralPath $StopSignalFile -PathType Leaf) {
         Remove-Item -LiteralPath $StopSignalFile -Force -ErrorAction SilentlyContinue
@@ -1037,7 +1180,17 @@ function Start-WatchBackgroundIfNeeded {
         return
     }
     if (Test-NamedMutexLocked -MutexName $WatchMutexName) {
-        return
+        $sameWatchVer = $false
+        if (Test-Path -LiteralPath $WatchEndpointFile -PathType Leaf) {
+            try {
+                $wep = ([IO.File]::ReadAllText($WatchEndpointFile, [Text.Encoding]::UTF8)) | ConvertFrom-Json
+                if ($null -ne $wep -and $null -ne $wep.PSObject.Properties['version'] -and [string]$wep.version -eq $GuardRuntimeVersion) {
+                    $sameWatchVer = $true
+                }
+            } catch {}
+        }
+        if ($sameWatchVer) { return }
+        Stop-WatchBackground
     }
     Clear-WatchStopSignals
     if (Test-Path -LiteralPath $LaunchVbsPath -PathType Leaf) {
@@ -1071,6 +1224,7 @@ function Stop-WatchBackground {
 function Invoke-WatchLoop {
     $watchMutex = New-Object System.Threading.Mutex($false, $WatchMutexName)
     $ownsWatch = $false
+    $publishedWatch = $false
     $stopEvent = $null
     try {
         try {
@@ -1087,8 +1241,16 @@ function Invoke-WatchLoop {
             return
         }
 
+        $wMeta = ([ordered]@{
+            pid        = $PID
+            version    = $GuardRuntimeVersion
+            startedUtc = [DateTime]::UtcNow.ToString('o')
+        } | ConvertTo-Json -Compress)
+        [IO.File]::WriteAllText($WatchEndpointFile, $wMeta, [Text.Encoding]::UTF8)
+        $publishedWatch = $true
+
         $agExe = Resolve-AntigravityExe
-        Write-LauncherLog -Scope 'WatchGuard' -Message "后台自动汉化守护已启动 (PID: $PID)。"
+        Write-LauncherLog -Scope 'WatchGuard' -Message "后台自动汉化守护已启动 (v$GuardRuntimeVersion, PID: $PID)。"
 
         $verifiedPort = 0
         $verifiedHansPid = 0
@@ -1116,6 +1278,8 @@ function Invoke-WatchLoop {
                 if (Test-NamedMutexLocked -MutexName $UpdaterMutexName) {
                     continue
                 }
+
+                Start-LocalBridgeIfNeeded
 
                 $dtPort = Read-DevToolsPortCandidate
                 $ipProps = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties()
@@ -1217,6 +1381,14 @@ function Invoke-WatchLoop {
 
         Write-LauncherLog -Scope 'WatchGuard' -Message "后台自动汉化守护已正常退出 (PID: $PID)。"
     } finally {
+        if ($ownsWatch -and $publishedWatch -and (Test-Path -LiteralPath $WatchEndpointFile -PathType Leaf)) {
+            try {
+                $curW = ([IO.File]::ReadAllText($WatchEndpointFile, [Text.Encoding]::UTF8)) | ConvertFrom-Json
+                if ($null -ne $curW -and [int]$curW.pid -eq $PID) {
+                    Remove-Item -LiteralPath $WatchEndpointFile -Force -ErrorAction SilentlyContinue
+                }
+            } catch {}
+        }
         if ($null -ne $stopEvent) {
             $stopEvent.Dispose()
         }
@@ -1234,6 +1406,7 @@ function Show-CurrentStatus {
     $attachedInfo = if ($null -ne $cdpEp) { Get-AttachedHansInfo -Port $cdpEp.Port } else { $null }
     $watchAlive = Test-NamedMutexLocked -MutexName $WatchMutexName
     $regEnabled = Test-StartupGuardRegistered
+    $bridgePortAlive = Get-ActiveLocalBridgePort
     $thoughtDesc = Get-ThoughtTranslationSummary
 
     Write-Host "================ Antigravity 汉化状态诊断 ================"
@@ -1242,8 +1415,9 @@ function Show-CurrentStatus {
     Write-Host ("3. 浏览器 CDP 端口  : {0}" -f ($(if ($null -ne $cdpEp) { "127.0.0.1:$($cdpEp.Port) (宿主 PID: $($cdpEp.OwnerPid))" } else { '未就绪' })))
     Write-Host ("4. 汉化注入监视器   : {0}" -f ($(if ($null -ne $attachedInfo) { "检测到活动连接 (PID: $($attachedInfo.Id))" } else { '未连接' })))
     Write-Host ("5. 后台自动汉化守护 : {0} | 登录自启: {1}" -f ($(if ($watchAlive) { '运行中 (约每 3 秒巡检)' } else { '未运行' }), $(if ($regEnabled) { '已开启' } else { '已关闭' })))
-    Write-Host ("6. 思考与动作汉化   : {0}" -f $thoughtDesc)
-    Write-Host ("7. 运行日志路径     : {0}" -f $LogPath)
+    Write-Host ("6. 本地直连翻译桥   : {0}" -f ($(if ($bridgePortAlive -gt 0) { "运行中 (127.0.0.1:$bridgePortAlive, 绕开海外代理防429)" } else { '未运行' })))
+    Write-Host ("7. 思考与动作汉化   : {0}" -f $thoughtDesc)
+    Write-Host ("8. 运行日志路径     : {0}" -f $LogPath)
     Write-Host "=========================================================="
 }
 
@@ -1264,31 +1438,66 @@ function Invoke-ThoughtTranslationMenu {
     Write-Host ""
     Write-Host "---------- 思考框与动作标签实时翻译设置 ----------"
     Write-Host ("当前状态: {0}" -f (Get-ThoughtTranslationSummary))
-    Write-Host "  [1] 使用免 Key 公开网页翻译 (默认推荐，即装即用，零反代风险)"
-    Write-Host "  [2] 配置独立 Google AI Studio GEMINI_API_KEY (直连官方 gemini-3.5-flash-lite)"
-    Write-Host "  [3] 关闭思考框实时翻译 (仅保留基础界面汉化)"
+    Write-Host "  [1] 免 Key 本地免代理直连 + 多段打包 (默认推荐，走自家宽带直连腾讯 TranSmart，彻底防代理 429)"
+    Write-Host "  [2] 配置智谱清言官方免费大模型 GLM-4-Flash API Key (国内直连永久免费、高并发)"
+    Write-Host "  [3] 配置硅基流动 SiliconFlow (免费 Qwen2.5-7B) / DeepSeek / 自定义 OpenAI 兼容接口"
+    Write-Host "  [4] 配置 Google AI Studio 独立 GEMINI_API_KEY (直连官方 gemini-3.5-flash-lite)"
+    Write-Host "  [5] 关闭思考框实时翻译 (仅保留基础界面汉化)"
     Write-Host "  [B] 返回"
     $sub = (Read-Host "输入序号").Trim().ToUpperInvariant()
 
     # Collect user intent outside lock so interactive prompt never holds LauncherMutex
     $intent = $null
     $pendingKey = ''
+    $pendingUrl = ''
+    $pendingModel = ''
     switch ($sub) {
         '1' {
-            $intent = 'google-free'
+            $intent = 'free-direct'
         }
         '2' {
-            $pendingKey = Read-SecretLineTrimmed -PromptText "粘贴独立 Google AI Studio GEMINI_API_KEY (隐藏回显；输入 CLEAR 清空已有 Key)"
+            $pendingKey = Read-SecretLineTrimmed -PromptText "粘贴智谱 BigModel API Key (隐藏回显；输入 CLEAR 清空已有 Key)"
             if ($pendingKey.ToUpperInvariant() -eq 'CLEAR') {
-                $intent = 'clear-key'
+                $intent = 'clear-llm'
             } elseif (-not [string]::IsNullOrWhiteSpace($pendingKey)) {
-                $intent = 'set-key'
+                $intent = 'set-zhipu'
             } else {
                 Write-Host "[取消] 未输入内容，保持原配置不变。"
                 return
             }
         }
         '3' {
+            $pendingKey = Read-SecretLineTrimmed -PromptText "粘贴 SiliconFlow / DeepSeek / OpenAI兼容 API Key (隐藏回显；输入 CLEAR 清空)"
+            if ($pendingKey.ToUpperInvariant() -eq 'CLEAR') {
+                $intent = 'clear-llm'
+            } elseif (-not [string]::IsNullOrWhiteSpace($pendingKey)) {
+                $inUrl = (Read-Host "接口地址 (直接回车默认使用硅基流动 https://api.siliconflow.cn/v1/chat/completions)").Trim()
+                $inModel = (Read-Host "模型名称 (直接回车默认使用硅基流动免费模型 Qwen/Qwen2.5-7B-Instruct)").Trim()
+                $pendingUrl = if ([string]::IsNullOrWhiteSpace($inUrl)) { 'https://api.siliconflow.cn/v1/chat/completions' } else { $inUrl }
+                $uCheck = $null
+                if (-not [Uri]::TryCreate($pendingUrl, [UriKind]::Absolute, [ref]$uCheck) -or
+                    ($uCheck.Scheme -ne 'https' -and -not ($uCheck.Scheme -eq 'http' -and $uCheck.Host -in @('127.0.0.1', 'localhost')))) {
+                    throw "自定义大模型地址必须使用 https:// (仅本机回环 127.0.0.1/localhost 允许 http://): $pendingUrl"
+                }
+                $pendingModel = if ([string]::IsNullOrWhiteSpace($inModel)) { 'Qwen/Qwen2.5-7B-Instruct' } else { $inModel }
+                $intent = 'set-openai-compat'
+            } else {
+                Write-Host "[取消] 未输入内容，保持原配置不变。"
+                return
+            }
+        }
+        '4' {
+            $pendingKey = Read-SecretLineTrimmed -PromptText "粘贴独立 Google AI Studio GEMINI_API_KEY (隐藏回显；输入 CLEAR 清空已有 Key)"
+            if ($pendingKey.ToUpperInvariant() -eq 'CLEAR') {
+                $intent = 'clear-gemini'
+            } elseif (-not [string]::IsNullOrWhiteSpace($pendingKey)) {
+                $intent = 'set-gemini'
+            } else {
+                Write-Host "[取消] 未输入内容，保持原配置不变。"
+                return
+            }
+        }
+        '5' {
             $intent = 'disable'
         }
         default {
@@ -1306,35 +1515,76 @@ function Invoke-ThoughtTranslationMenu {
             $cfg = [ordered]@{
                 enabled      = $true
                 provider     = 'auto'
+                bridgePort   = 47831
+                bridgeToken  = ''
+                llmApiKey    = ''
+                llmBaseUrl   = 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+                llmModel     = 'glm-4-flash'
                 geminiApiKey = ''
                 geminiModel  = 'gemini-3.5-flash-lite'
             }
         }
         switch ($intent) {
-            'google-free' {
-                $cfg.enabled = $true
-                $cfg.provider = 'google-free'
-                Write-Host "[已保存] 已切换为免 Key 公开网页翻译 (保留中英对照 + 代码反引号保护)。"
+            'free-direct' {
+                $cfg['enabled'] = $true
+                $cfg['provider'] = 'free-direct'
+                Write-Host "[已保存] 已切换为免 Key 本地免代理直连 + 多段打包模式。"
             }
-            'clear-key' {
-                $cfg.geminiApiKey = ''
-                $cfg.provider = 'auto'
-                Write-Host "[已保存] 已清空 GEMINI_API_KEY，自动回退至免 Key 网页翻译。"
+            'clear-llm' {
+                $cfg['llmApiKey'] = ''
+                if ($cfg['provider'] -in @('zhipu', 'openai-compat')) { $cfg['provider'] = 'auto' }
+                Write-Host "[已保存] 已清空国内大模型 API Key，自动回退至免 Key 本地直连模式。"
             }
-            'set-key' {
-                $cfg.enabled = $true
-                $cfg.provider = 'gemini'
-                $cfg.geminiApiKey = $pendingKey
-                $cfg.geminiModel = 'gemini-3.5-flash-lite'
-                Write-Host "[已保存] 已配置官方 GEMINI_API_KEY (模型: gemini-3.5-flash-lite，失败自动降级网页翻译)。"
+            'set-zhipu' {
+                $cfg['enabled'] = $true
+                $cfg['provider'] = 'zhipu'
+                $cfg['llmApiKey'] = $pendingKey
+                $cfg['llmBaseUrl'] = 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+                $cfg['llmModel'] = 'glm-4-flash'
+                Write-Host "[已保存] 已启用智谱官方免费大模型 glm-4-flash (国内免代理直连，异常自动降级本地直连桥)。"
+            }
+            'set-openai-compat' {
+                $cfg['enabled'] = $true
+                $cfg['provider'] = 'openai-compat'
+                $cfg['llmApiKey'] = $pendingKey
+                $cfg['llmBaseUrl'] = $pendingUrl
+                $cfg['llmModel'] = $pendingModel
+                Write-Host "[已保存] 已启用独立大模型接口 ($pendingModel，异常自动降级本地直连桥)。"
+            }
+            'clear-gemini' {
+                $cfg['geminiApiKey'] = ''
+                if ($cfg['provider'] -eq 'gemini') { $cfg['provider'] = 'auto' }
+                Write-Host "[已保存] 已清空 GEMINI_API_KEY，自动回退至免 Key 本地直连模式。"
+            }
+            'set-gemini' {
+                $cfg['enabled'] = $true
+                $cfg['provider'] = 'gemini'
+                $cfg['geminiApiKey'] = $pendingKey
+                $cfg['geminiModel'] = 'gemini-3.5-flash-lite'
+                Write-Host "[已保存] 已配置官方 GEMINI_API_KEY (模型: gemini-3.5-flash-lite，失败自动降级本地直连桥)。"
             }
             'disable' {
-                $cfg.enabled = $false
+                $cfg['enabled'] = $false
                 Write-Host "[已保存] 已关闭思考框与动作标签实时翻译。"
             }
         }
         Save-ThoughtConfigNormalized -ConfigMap $cfg
+        $shouldRunBridge = [bool]$cfg['enabled']
+    } finally {
+        Exit-LauncherMutex -Mutex $lock
+    }
 
+    if ($shouldRunBridge) {
+        Start-LocalBridgeIfNeeded
+    } else {
+        Stop-LocalBridge
+    }
+
+    $lock2 = Enter-LauncherMutex -TimeoutMs 15000
+    if ($null -eq $lock2) {
+        throw "获取汉化器操作锁超时，请稍后重试。"
+    }
+    try {
         $ov = Ensure-OverlayReady -ForceRebuild -CallerHoldsLauncherMutex -Scope 'MenuConfig'
         if (-not $ov.Available) {
             Write-Warning "合成 antigravity-hans-overlay.js 未成功，请检查日志: $LogPath"
@@ -1349,7 +1599,7 @@ function Invoke-ThoughtTranslationMenu {
             Write-Host "[生效] 外部汉化脚本已更新，下次打开 Antigravity 时自动生效。"
         }
     } finally {
-        Exit-LauncherMutex -Mutex $lock
+        Exit-LauncherMutex -Mutex $lock2
     }
 }
 
@@ -1358,22 +1608,25 @@ try {
     if ($DisableAutoGuard) {
         Set-StartupGuardRegistration -Enable $false
         Stop-WatchBackground
+        Stop-LocalBridge
         Stop-HansMonitorsSynchronized
-        Write-Host "[完成] 已关闭后台自动守护并停止当前汉化监视器。"
+        Write-Host "[完成] 已关闭后台自动守护、本地翻译桥并停止当前汉化监视器。"
         return
     }
 
     if ($StopAll) {
         Stop-WatchBackground
+        Stop-LocalBridge
         Stop-HansMonitorsSynchronized
-        Write-Host "[完成] 已停止后台守护与汉化监视器。"
+        Write-Host "[完成] 已停止后台守护、本地翻译桥与汉化监视器。"
         return
     }
 
     if ($EnableAutoGuard) {
         Set-StartupGuardRegistration -Enable $true
+        Start-LocalBridgeIfNeeded
         Start-WatchBackgroundIfNeeded
-        Write-Host "[完成] 已开启自动汉化后台守护与登录自启。"
+        Write-Host "[完成] 已开启自动汉化后台守护、本地免代理翻译桥与登录自启。"
         return
     }
 
@@ -1396,6 +1649,8 @@ try {
     }
 
     if ($RebuildOverlay) {
+        Start-LocalBridgeIfNeeded
+        Start-WatchBackgroundIfNeeded
         $lock = Enter-LauncherMutex -TimeoutMs 15000
         if ($null -eq $lock) {
             throw "获取汉化器操作锁超时，无法重建外部汉化脚本。"
@@ -1428,12 +1683,13 @@ try {
         Write-Host "  [1] 立即对当前窗口挂载汉化并开启自动守护 (推荐)"
         Write-Host "  [2] 停止当前汉化监视器并关闭开机自动守护"
         Write-Host "  [3] 重新修复桌面与开始菜单快捷方式"
-        Write-Host "  [4] 配置思考框实时翻译源 (免Key网页翻译 / 官方 GEMINI_API_KEY)"
+        Write-Host "  [4] 配置思考框实时翻译源 (免Key直连桥 / 智谱免费GLM-4 / SiliconFlow / Gemini)"
         Write-Host "  [Q] 退出"
         $choice = (Read-Host "输入序号").Trim().ToUpperInvariant()
         switch ($choice) {
             '1' {
                 Set-StartupGuardRegistration -Enable $true
+                Start-LocalBridgeIfNeeded
                 Start-WatchBackgroundIfNeeded
                 if ($null -ne (Get-AntigravityMainProcess -ExpectedExePath $AntigravityExe)) {
                     $r = Ensure-HansAttached -ExpectedAntigravityExe $AntigravityExe -WaitPortSeconds 15 -Scope 'Menu'
@@ -1445,8 +1701,9 @@ try {
             '2' {
                 Set-StartupGuardRegistration -Enable $false
                 Stop-WatchBackground
+                Stop-LocalBridge
                 Stop-HansMonitorsSynchronized
-                Write-Host "[完成] 已停止汉化监视器并取消自动守护。"
+                Write-Host "[完成] 已停止汉化监视器、本地翻译桥并取消自动守护。"
             }
             '3' {
                 Sync-LauncherShortcuts -AntigravityExe $AntigravityExe
@@ -1461,6 +1718,7 @@ try {
     }
 
     if ($AttachOnly) {
+        Start-LocalBridgeIfNeeded
         Start-WatchBackgroundIfNeeded
         $mainProc = Get-AntigravityMainProcess -ExpectedExePath $AntigravityExe
         if ($null -ne $mainProc) {
@@ -1477,6 +1735,7 @@ try {
         throw "未找到 Antigravity.exe 安装路径，请确认 Antigravity 已正确安装。"
     }
 
+    Start-LocalBridgeIfNeeded
     Start-WatchBackgroundIfNeeded
 
     $launchLock = Enter-LauncherMutex -TimeoutMs 15000

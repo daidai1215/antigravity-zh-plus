@@ -66,6 +66,7 @@ function Assert-ValidPackageRoot {
         'skills\antigravity-zh-plus\scripts\runtime\launch-hans.vbs',
         'skills\antigravity-zh-plus\scripts\runtime\update-hans.ps1',
         'skills\antigravity-zh-plus\scripts\runtime\build-overlay.ps1',
+        'skills\antigravity-zh-plus\scripts\runtime\local-bridge.ps1',
         'skills\antigravity-zh-plus\scripts\runtime\thought-addon.js',
         'skills\antigravity-zh-plus\scripts\runtime\thought-config.default.json'
     )
