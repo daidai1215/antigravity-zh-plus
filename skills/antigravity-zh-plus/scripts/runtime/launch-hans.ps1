@@ -16,7 +16,7 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
-$GuardRuntimeVersion = '1.2.0'
+$GuardRuntimeVersion = '1.3.0'
 $ToolDir = $PSScriptRoot
 $HansExeName = 'antigravity-hans-windows-amd64.exe'
 $HansExePath = Join-Path $ToolDir $HansExeName
@@ -243,10 +243,115 @@ function Get-CdpCandidatePorts {
     if ($dtPort -gt 0) {
         $list.Add($dtPort)
     }
-    if (-not $list.Contains(9222)) {
-        $list.Add(9222)
+    foreach ($p in @(58321, 58322, 58323, 58324, 58325, 9222)) {
+        if (-not $list.Contains($p)) {
+            $list.Add($p)
+        }
     }
     return $list.ToArray()
+}
+
+function Invoke-LoopbackHttpGetText {
+    param(
+        [string]$Url,
+        [int]$TimeoutMs = 2000
+    )
+    $req = [System.Net.HttpWebRequest]::Create($Url)
+    $req.Method = 'GET'
+    $req.Timeout = $TimeoutMs
+    $req.ReadWriteTimeout = $TimeoutMs
+    $req.Proxy = [System.Net.GlobalProxySelection]::GetEmptyWebProxy()
+    $req.KeepAlive = $false
+    $resp = $null
+    try {
+        $resp = [System.Net.HttpWebResponse]$req.GetResponse()
+        if ([int]$resp.StatusCode -ne 200) { return $null }
+        $stream = $resp.GetResponseStream()
+        $reader = New-Object System.IO.StreamReader($stream, [Text.Encoding]::UTF8)
+        try {
+            return $reader.ReadToEnd()
+        } finally {
+            $reader.Dispose()
+            $stream.Dispose()
+        }
+    } catch [System.Net.WebException] {
+        if ($null -ne $_.Exception.Response) {
+            try { $_.Exception.Response.Dispose() } catch {}
+        }
+        return $null
+    } finally {
+        if ($null -ne $resp) { $resp.Dispose() }
+    }
+}
+
+function Get-ProcessRemoteDebuggingSwitchState {
+    param([int]$ProcessId)
+    if ($ProcessId -le 0) { return 'Unknown' }
+    try {
+        $proc = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        if ($null -eq $proc -or [string]::IsNullOrWhiteSpace([string]$proc.CommandLine)) { return 'Unknown' }
+        $cmd = [string]$proc.CommandLine
+        if ($cmd -match '(?i)(?:^|\s)--remote-debugging-port(?:=|\s|$)') {
+            return 'HasSwitch'
+        }
+        return 'MissingSwitch'
+    } catch {
+        return 'Unknown'
+    }
+}
+
+function Get-ProcessStartTicksSafe {
+    param(
+        [int]$ProcessId,
+        [string]$ExpectedExePath
+    )
+    $gp = $null
+    try {
+        $gp = Get-Process -Id $ProcessId -ErrorAction Stop
+        if ($gp.HasExited -or $gp.ProcessName -ne 'Antigravity') { return [int64]0 }
+        if ($ExpectedExePath -and [string]$gp.Path -ne $ExpectedExePath) { return [int64]0 }
+        return [int64]$gp.StartTime.ToUniversalTime().Ticks
+    } catch {
+        return [int64]0
+    } finally {
+        if ($null -ne $gp) { $gp.Dispose() }
+    }
+}
+
+function Request-GracefulAntigravityQuit {
+    param(
+        [int]$PreferredPid,
+        [int64]$ExpectedStartTicks,
+        [string]$ExpectedExePath,
+        [int]$TimeoutSeconds = 10
+    )
+    $gp = $null
+    try {
+        $gp = Get-Process -Id $PreferredPid -ErrorAction Stop
+        if (-not $gp.HasExited -and
+            $gp.ProcessName -eq 'Antigravity' -and
+            (-not $ExpectedExePath -or [string]$gp.Path -eq $ExpectedExePath) -and
+            ($ExpectedStartTicks -le 0 -or $gp.StartTime.ToUniversalTime().Ticks -eq $ExpectedStartTicks)) {
+            [void]$gp.CloseMainWindow()
+        } else {
+            return $false
+        }
+    } catch {
+        return ($null -eq (Get-AntigravityMainProcess -ExpectedExePath $ExpectedExePath))
+    } finally {
+        if ($null -ne $gp) { $gp.Dispose() }
+    }
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        $stillMain = Get-AntigravityMainProcess -ExpectedExePath $ExpectedExePath
+        if ($null -eq $stillMain) {
+            Start-Sleep -Milliseconds 300
+            return $true
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    return $false
 }
 
 function Test-RecentLauncherSpawnAlive {
@@ -307,12 +412,16 @@ function Save-LauncherSpawnRecord {
 }
 
 function Get-VerifiedAntigravityCdpEndpoint {
-    param([string]$ExpectedExePath)
+    param(
+        [string]$ExpectedExePath,
+        [int[]]$Ports = @()
+    )
 
     $listenRows = @()
     try {
         $listenRows = @(Get-NetTCPConnection -LocalAddress '127.0.0.1' -State Listen -ErrorAction SilentlyContinue)
-        foreach ($port in @(Get-CdpCandidatePorts)) {
+        $portsToProbe = if ($null -ne $Ports -and $Ports.Count -gt 0) { $Ports } else { @(Get-CdpCandidatePorts) }
+        foreach ($port in $portsToProbe) {
             $portListeners = @($listenRows | Where-Object { $_.LocalPort -eq $port })
             if ($portListeners.Count -eq 0) { continue }
 
@@ -338,9 +447,9 @@ function Get-VerifiedAntigravityCdpEndpoint {
 
             $wsUrl = $null
             try {
-                $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$port/json/version" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
-                if ($resp.StatusCode -ne 200 -or [string]::IsNullOrWhiteSpace($resp.Content)) { continue }
-                $verObj = $resp.Content | ConvertFrom-Json
+                $content = Invoke-LoopbackHttpGetText -Url "http://127.0.0.1:$port/json/version" -TimeoutMs 2000
+                if ([string]::IsNullOrWhiteSpace($content)) { continue }
+                $verObj = $content | ConvertFrom-Json
                 $wsProp = $verObj.PSObject.Properties['webSocketDebuggerUrl']
                 if ($null -eq $wsProp -or [string]::IsNullOrWhiteSpace([string]$wsProp.Value)) { continue }
                 $wsCandidate = [string]$wsProp.Value
@@ -1261,8 +1370,7 @@ function Invoke-WatchLoop {
         $verifiedOwnerTicks = [int64]0
         $reverifySw = [System.Diagnostics.Stopwatch]::StartNew()
 
-        $nonAgBackoffPort = 0
-        $nonAgBackoffSw = [System.Diagnostics.Stopwatch]::StartNew()
+        $nonAgBackoffMap = @{}
 
         # Perform immediate initial check before first 3s sleep
         $firstIteration = $true
@@ -1283,26 +1391,24 @@ function Invoke-WatchLoop {
 
                 Start-LocalBridgeIfNeeded
 
-                $dtPort = Read-DevToolsPortCandidate
+                $candPorts = @(Get-CdpCandidatePorts)
                 $ipProps = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties()
                 $listeners = $ipProps.GetActiveTcpListeners()
-
-                $activePort = 0
-                if ($dtPort -gt 0) {
-                    foreach ($ep in $listeners) {
-                        if ($ep.Port -eq $dtPort -and [System.Net.IPAddress]::IsLoopback($ep.Address)) {
-                            $activePort = $dtPort
-                            break
-                        }
+                $loopbackListening = New-Object 'System.Collections.Generic.HashSet[int]'
+                foreach ($ep in $listeners) {
+                    if ([System.Net.IPAddress]::IsLoopback($ep.Address)) {
+                        [void]$loopbackListening.Add([int]$ep.Port)
                     }
                 }
-                if ($activePort -eq 0) {
-                    foreach ($ep in $listeners) {
-                        if ($ep.Port -eq 9222 -and [System.Net.IPAddress]::IsLoopback($ep.Address)) {
-                            $activePort = 9222
-                            break
-                        }
+
+                $activePort = 0
+                foreach ($cp in $candPorts) {
+                    if (-not $loopbackListening.Contains([int]$cp)) { continue }
+                    if ($nonAgBackoffMap.ContainsKey([int]$cp) -and $nonAgBackoffMap[[int]$cp].Elapsed.TotalSeconds -lt 10) {
+                        continue
                     }
+                    $activePort = [int]$cp
+                    break
                 }
 
                 if ($activePort -eq 0) {
@@ -1351,21 +1457,18 @@ function Invoke-WatchLoop {
                     }
                 }
 
-                if ($nonAgBackoffPort -eq $activePort -and $nonAgBackoffSw.Elapsed.TotalSeconds -lt 10) {
-                    continue
-                }
-
                 if (-not $agExe -or -not (Test-Path -LiteralPath $agExe -PathType Leaf)) {
                     $agExe = Resolve-AntigravityExe
                 }
 
-                $cdpCheck = Get-VerifiedAntigravityCdpEndpoint -ExpectedExePath $agExe
+                $cdpCheck = Get-VerifiedAntigravityCdpEndpoint -ExpectedExePath $agExe -Ports @($activePort)
                 if ($null -eq $cdpCheck) {
-                    $nonAgBackoffPort = $activePort
-                    $nonAgBackoffSw.Restart()
+                    $nonAgBackoffMap[$activePort] = [System.Diagnostics.Stopwatch]::StartNew()
                     continue
                 }
-                $nonAgBackoffPort = 0
+                if ($nonAgBackoffMap.ContainsKey($cdpCheck.Port)) {
+                    $nonAgBackoffMap.Remove($cdpCheck.Port)
+                }
 
                 $res = Ensure-HansAttached -ExpectedAntigravityExe $agExe -WaitPortSeconds 5 -Scope 'WatchGuard' -CancelEvent $stopEvent
                 if ($res.Attached) {
@@ -1420,6 +1523,11 @@ function Show-CurrentStatus {
     Write-Host ("6. 本地直连翻译桥   : {0}" -f ($(if ($bridgePortAlive -gt 0) { "运行中 (127.0.0.1:$bridgePortAlive, 绕开海外代理防429)" } else { '未运行' })))
     Write-Host ("7. 思考与动作汉化   : {0}" -f $thoughtDesc)
     Write-Host ("8. 运行日志路径     : {0}" -f $LogPath)
+    if ($null -ne $mainProc -and $null -eq $cdpEp) {
+        Write-Host "[提示] 当前运行中的 Antigravity (PID: $($mainProc.ProcessId)) 未开启 CDP 调试端口。"
+        Write-Host "       Antigravity 2.33+ 已将 CDP 改为显式启动开关，请退出当前窗口后通过桌面「Antigravity 中文」快捷方式启动"
+        Write-Host "       (或在 Cockpit / 启动参数中加入: --remote-debugging-port=0 --remote-debugging-address=127.0.0.1)。"
+    }
     Write-Host "=========================================================="
 }
 
@@ -1684,11 +1792,15 @@ try {
             }
             $mainProc = Get-AntigravityMainProcess -ExpectedExePath $AntigravityExe
             if ($null -ne $mainProc) {
-                $res = Ensure-HansAttached -ExpectedAntigravityExe $AntigravityExe -WaitPortSeconds 15 -Scope 'RebuildOverlay' -CallerHoldsLauncherMutex -ForceReattach -SkipOverlayBuild
-                if (-not $res.Attached) {
-                    exit 2
+                if ($mainProc.State -eq 'ConfirmedUi' -and (Get-ProcessRemoteDebuggingSwitchState -ProcessId ([int]$mainProc.ProcessId)) -eq 'MissingSwitch') {
+                    Write-Host "[完成] 已重建外部汉化脚本。当前运行中的 Antigravity (PID: $($mainProc.ProcessId)) 未携带 --remote-debugging-port 启动（Antigravity 2.33+ 需带调试端口启动才能热注入）；请关闭后通过「Antigravity 中文」重启即可生效。"
+                } else {
+                    $res = Ensure-HansAttached -ExpectedAntigravityExe $AntigravityExe -WaitPortSeconds 15 -Scope 'RebuildOverlay' -CallerHoldsLauncherMutex -ForceReattach -SkipOverlayBuild
+                    if (-not $res.Attached) {
+                        exit 2
+                    }
+                    Write-Host "[完成] 已重建外部汉化脚本并热重载至运行中窗口 (端口 $($res.Port), PID $($res.HansPid))。"
                 }
-                Write-Host "[完成] 已重建外部汉化脚本并热重载至运行中窗口 (端口 $($res.Port), PID $($res.HansPid))。"
             } else {
                 Write-Host "[完成] 已重建 antigravity-hans-overlay.js。"
             }
@@ -1713,11 +1825,17 @@ try {
                 Set-StartupGuardRegistration -Enable $true
                 Start-LocalBridgeIfNeeded
                 Start-WatchBackgroundIfNeeded
-                if ($null -ne (Get-AntigravityMainProcess -ExpectedExePath $AntigravityExe)) {
-                    $r = Ensure-HansAttached -ExpectedAntigravityExe $AntigravityExe -WaitPortSeconds 15 -Scope 'Menu'
-                    Write-Host ($(if ($r.Attached) { "[成功] 已建立汉化连接 (端口 $($r.Port), PID $($r.HansPid))。" } else { "[提示] 暂未检测到就绪端口，守护进程将在窗口就绪后自动挂载。" }))
+                $menuMain = Get-AntigravityMainProcess -ExpectedExePath $AntigravityExe
+                if ($null -ne $menuMain) {
+                    if ($menuMain.State -eq 'ConfirmedUi' -and (Get-ProcessRemoteDebuggingSwitchState -ProcessId ([int]$menuMain.ProcessId)) -eq 'MissingSwitch') {
+                        Write-Host "[提示] 自动守护已开启，但当前 Antigravity (PID: $($menuMain.ProcessId)) 启动时未携带 --remote-debugging-port（Antigravity 2.33+ 默认关闭 CDP 端口）。"
+                        Write-Host "       请退出当前 Antigravity 后，点击桌面「Antigravity 中文」快捷方式启动即可自动汉化。"
+                    } else {
+                        $r = Ensure-HansAttached -ExpectedAntigravityExe $AntigravityExe -WaitPortSeconds 15 -Scope 'Menu'
+                        Write-Host ($(if ($r.Attached) { "[成功] 已建立汉化连接 (端口 $($r.Port), PID $($r.HansPid))。" } else { "[提示] 暂未检测到就绪端口，守护进程将在窗口就绪后自动挂载。" }))
+                    }
                 } else {
-                    Write-Host "[成功] 自动守护已就绪，打开 Antigravity 时将自动挂载汉化。"
+                    Write-Host "[成功] 自动守护已就绪，点击「Antigravity 中文」打开时将自动挂载汉化。"
                 }
             }
             '2' {
@@ -1744,6 +1862,10 @@ try {
         Start-WatchBackgroundIfNeeded
         $mainProc = Get-AntigravityMainProcess -ExpectedExePath $AntigravityExe
         if ($null -ne $mainProc) {
+            if ($mainProc.State -eq 'ConfirmedUi' -and (Get-ProcessRemoteDebuggingSwitchState -ProcessId ([int]$mainProc.ProcessId)) -eq 'MissingSwitch') {
+                Write-Host "[提示] 当前运行中的 Antigravity (PID: $($mainProc.ProcessId)) 未携带 --remote-debugging-port 启动，无法热挂载；请通过「Antigravity 中文」重启。"
+                exit 2
+            }
             $res = Ensure-HansAttached -ExpectedAntigravityExe $AntigravityExe -WaitPortSeconds 15 -Scope 'AttachOnly'
             if (-not $res.Attached) {
                 exit 2
@@ -1760,17 +1882,54 @@ try {
     Start-LocalBridgeIfNeeded
     Start-WatchBackgroundIfNeeded
 
+    # Prompt outside mutex if Antigravity 2.33+ is already running without --remote-debugging-port
+    $restartApprovedPid = 0
+    $restartApprovedTicks = [int64]0
+    $preExisting = Get-AntigravityMainProcess -ExpectedExePath $AntigravityExe
+    if ($null -ne $preExisting -and $preExisting.State -eq 'ConfirmedUi' -and (Get-ProcessRemoteDebuggingSwitchState -ProcessId ([int]$preExisting.ProcessId)) -eq 'MissingSwitch') {
+        $capturedPid = [int]$preExisting.ProcessId
+        $capturedTicks = Get-ProcessStartTicksSafe -ProcessId $capturedPid -ExpectedExePath $AntigravityExe
+        $wshPopup = New-Object -ComObject WScript.Shell
+        $msg = "检测到 Antigravity 已在运行，但当前窗口未开启 CDP 调试端口（Antigravity 2.33+ 需携带 --remote-debugging-port 才能动态汉化）。`r`n`r`n是否温和关闭当前窗口，并立即以「中文调试模式」重新启动？`r`n（选择「否」将仅切换回原窗口，不做关闭）"
+        $ans = $wshPopup.Popup($msg, 30, 'Antigravity 中文启动器', 36)
+        if ($ans -eq 6 -and $capturedTicks -gt 0) {
+            $restartApprovedPid = $capturedPid
+            $restartApprovedTicks = $capturedTicks
+        } else {
+            Write-LauncherLog -Scope 'Launcher' -Message "用户取消重启无 CDP 窗口，仅激活原窗口 (PID: $capturedPid)。"
+            if ($capturedTicks -gt 0 -and (Get-ProcessStartTicksSafe -ProcessId $capturedPid -ExpectedExePath $AntigravityExe) -eq $capturedTicks) {
+                Set-ProcessWindowForeground -PreferredPid $capturedPid
+            }
+            return
+        }
+    }
+
     $launchLock = Enter-LauncherMutex -TimeoutMs 15000
     if ($null -eq $launchLock) {
         throw "另一个启动或更新流程正在进行中，获取操作锁超时。"
     }
     try {
+        if ($restartApprovedPid -gt 0 -and $restartApprovedTicks -gt 0) {
+            $curTicks = Get-ProcessStartTicksSafe -ProcessId $restartApprovedPid -ExpectedExePath $AntigravityExe
+            if ($curTicks -eq $restartApprovedTicks) {
+                Write-LauncherLog -Scope 'Launcher' -Message "用户同意温和重启未开启 CDP 的 Antigravity (PID: $restartApprovedPid)。"
+                $quitOk = Request-GracefulAntigravityQuit -PreferredPid $restartApprovedPid -ExpectedStartTicks $restartApprovedTicks -ExpectedExePath $AntigravityExe -TimeoutSeconds 10
+                if (-not $quitOk) {
+                    Write-LauncherLog -Scope 'Launcher' -Message "温和退出等待超时，中止重启以避免丢失未保存内容。"
+                    $wshWarn = New-Object -ComObject WScript.Shell
+                    [void]$wshWarn.Popup("原 Antigravity 窗口未在 10 秒内退出，请手动保存并完全退出后，再点击「Antigravity 中文」启动。", 15, 'Antigravity 中文启动器', 48)
+                    return
+                }
+            }
+        }
+
         $existingMain = Get-AntigravityMainProcess -ExpectedExePath $AntigravityExe
         if ($null -eq $existingMain) {
-            Write-LauncherLog -Scope 'Launcher' -Message "未检测到主界面进程，正在直接启动: $AntigravityExe"
+            $launchArgs = @('--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1')
+            Write-LauncherLog -Scope 'Launcher' -Message "未检测到主界面进程，正在以随机回环调试端口 (--remote-debugging-port=0) 启动: $AntigravityExe"
             $startedApp = $null
             try {
-                $startedApp = Start-Process -FilePath $AntigravityExe -WorkingDirectory ([IO.Path]::GetDirectoryName($AntigravityExe)) -PassThru
+                $startedApp = Start-Process -FilePath $AntigravityExe -ArgumentList $launchArgs -WorkingDirectory ([IO.Path]::GetDirectoryName($AntigravityExe)) -PassThru
                 Save-LauncherSpawnRecord -ProcessObj $startedApp
             } finally {
                 if ($null -ne $startedApp) { $startedApp.Dispose() }
@@ -1778,6 +1937,9 @@ try {
         } else {
             Write-LauncherLog -Scope 'Launcher' -Message "检测到已运行主界面进程 (PID: $($existingMain.ProcessId), 状态: $($existingMain.State))，激活窗口并核验汉化连接。"
             Set-ProcessWindowForeground -PreferredPid ([int]$existingMain.ProcessId)
+            if ($existingMain.State -eq 'ConfirmedUi' -and (Get-ProcessRemoteDebuggingSwitchState -ProcessId ([int]$existingMain.ProcessId)) -eq 'MissingSwitch') {
+                return
+            }
         }
 
         $attachRes = Ensure-HansAttached -ExpectedAntigravityExe $AntigravityExe -WaitPortSeconds 30 -Scope 'Launcher' -CallerHoldsLauncherMutex

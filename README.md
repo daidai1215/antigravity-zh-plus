@@ -8,7 +8,7 @@
 
 ## 核心特性
 
-1. **零改包、官方更新不失效**：绝不修改 `app.asar` 安装包。轻量级后台守护（`WatchGuard`）在官方自动升级重启窗口后 **3 秒内自动重新挂载汉化**。
+1. **零改包、完美适配 Antigravity 2.33+（含调试端口自动开启）**：绝不修改 `app.asar` 安装包。针对 **Antigravity 2.33+ 默认关闭 CDP 调试端口**的新变化，桌面 **`Antigravity 中文`** 快捷方式会自动携带 `--remote-debugging-port` 与 `--remote-debugging-address=127.0.0.1` 启动，并在发现旧窗口未带调试端口时提供一键温和重启；如果你通过 Cockpit 等外部启动器打开，只需在启动参数追加 `--remote-debugging-port=0 --remote-debugging-address=127.0.0.1`，后台守护（`WatchGuard`）即可在 **3 秒内自动挂载汉化**。
 2. **本地免代理直连桥 + 多段打包（彻底根治共享代理 IP `429` 限流）**：
    - 默认自带仅监听本机回环 `127.0.0.1` 的轻量直连桥（`local-bridge.ps1`，严格校验 `Origin` 与 128 位随机鉴权 Token），强制 `UseProxy = false` **绕开海外共享代理出口 IP**，直接通过你自己的**国内家庭宽带独享 IP** 连接腾讯 AI Lab `transmart.qq.com` 神经机器翻译。
    - 同一思考框内的多段英文自动合并为 **1 次批量请求**（请求次数立减 ~75%），免注册、免填任何 Key 即装即稳。

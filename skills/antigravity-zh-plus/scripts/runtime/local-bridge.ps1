@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 
-$BridgeRuntimeVersion = '1.2.0'
+$BridgeRuntimeVersion = '1.3.0'
 $ToolDir = $PSScriptRoot
 $ConfigPath = Join-Path $ToolDir 'thought-config.json'
 $StateDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'antigravity-hans-guard'
